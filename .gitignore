@@ -8,6 +8,7 @@ dist/
 build/
 tmp/
 UserData/
+DB/
 package-lock.json
 # 忽略某类文件
 *.log
