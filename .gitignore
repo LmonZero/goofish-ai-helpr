@@ -16,5 +16,6 @@ package-lock.json
 *.env
 *demo.js
 *.png
+*-local.json
 # 强制不忽略（例外）
 !.gitignore
