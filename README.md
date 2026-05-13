@@ -13,6 +13,12 @@ node AIFish.js xx.json
 
 ```
 
+# node 版本
+
+```
+v22.22.2
+```
+
 # 说明
 
 playwright 人肉浏览器ai deepseek
