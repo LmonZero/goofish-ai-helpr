@@ -209,11 +209,23 @@ db.exec(`CREATE INDEX IF NOT EXISTS idx_productId ON t_dat_xianyu_cache (addr,pr
                 //检查是否有下一页按钮
                 const pageFoot = await xainyupage.$('#content > div.search-container--eigqxPi6 > div.search-filter-up-container--IKSFALsr > div.search-filter-distance-page-container--aTsABDJh > div.search-page-tiny-container--GNO3e2D8 > span');
                 // #content > div.search-container--eigqxPi6 > div.search-footer-page-container--e02TuanR > div > div.search-pagination-pageitem-container--adfiUKZP > button:nth-child(4)
-                const nextPageButton = await xainyupage.$('#content > div.search-container--eigqxPi6 > div.search-footer-page-container--e02TuanR > div > div.search-pagination-pageitem-container--adfiUKZP > button:nth-child(4)');
+                // #content > div.search-container--eigqxPi6 > div.search-footer-page-container--e02TuanR > div > div.search-pagination-pageitem-container--adfiUKZP > button
+                const nextPageButtons = await xainyupage.$$('#content > div.search-container--eigqxPi6 > div.search-footer-page-container--e02TuanR > div > div.search-pagination-pageitem-container--adfiUKZP > button');
+                let nextPageButton = nextPageButtons[1] ? nextPageButtons[1] : null;
+
                 if (nextPageButton) {
                     const pageFootText = await pageFoot.textContent();
                     console.log('当前页码', pageFootText);
                     const parts = pageFootText.split('/')
+
+                    if (lastPage == parts[0]) {
+                        console.log('页码未更新，可能已经到了最后一页');
+                        break;
+                    }
+
+                    lastPage = parts[0];
+
+
                     if (parts[0] == parts[1]) {
                         console.log('已到最后一页');
                         break;
@@ -224,6 +236,7 @@ db.exec(`CREATE INDEX IF NOT EXISTS idx_productId ON t_dat_xianyu_cache (addr,pr
                     }
                 } else {
                     console.log('未找到下一页按钮，可能页面结构已变化，或者已经到了最后一页');
+                    await sleep(5000 * 10000);
                     break;
                 }
             }
