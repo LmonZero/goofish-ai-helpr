@@ -1,0 +1,11 @@
+{
+	"keyword": "光威龙云三代综合竿 4.5米,5.4米",
+	"intelligent": true,
+	"inputinfo": "- 参考淘宝价格:4.5米224元,5.4米293元",
+	"prompt": ["./prompt/xianyu1.txt", "./prompt/xianyu2.txt"],
+	"againDay": 2,
+	"bargainDay": 7,
+	"phtoneDomain": "https://h5.m.goofish.com",
+	"dataName": "demo",
+	"ddUrl": "https://oapi.dingtalk.com/robot/send?access_token=7fb99a459f07e0880ad66e5126f61f8dd20744960d91da5067db041fe31fd39e"
+}

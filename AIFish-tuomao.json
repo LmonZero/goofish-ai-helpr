@@ -1,0 +1,11 @@
+{
+	"keyword": "康佳脱毛仪3301",
+	"intelligent": true,
+	"inputinfo": "- 参考淘宝价格:554元 \n - 附加需求版本: 型号3301 版本max",
+	"prompt": ["./prompt/xianyu1.txt", "./prompt/xianyu2.txt"],
+	"againDay": 2,
+	"bargainDay": 7,
+	"phtoneDomain": "https://h5.m.goofish.com",
+	"dataName": "tuomao",
+	"ddUrl": "https://oapi.dingtalk.com/robot/send?access_token=7fb99a459f07e0880ad66e5126f61f8dd20744960d91da5067db041fe31fd39e"
+}

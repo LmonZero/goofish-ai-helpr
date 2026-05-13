@@ -1,0 +1,19 @@
+# 忽略单个文件
+config.json
+secret.key
+
+# 忽略文件夹（最常用）
+node_modules/
+dist/
+build/
+tmp/
+UserData/
+package-lock.json
+# 忽略某类文件
+*.log
+*.tmp
+*.env
+*demo.js
+*.png
+# 强制不忽略（例外）
+!.gitignore
