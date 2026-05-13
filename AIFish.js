@@ -256,6 +256,7 @@ async function dingdingMsgNotifyFish(info) {
         + `- 标题：${info.description.slice(0, 100)}...\n`
         + `- 识别结果：${info.aiReply.identified_brand_model}\n`
         + `- 价格：${info.price}\n`
+        + `- 是否个人卖家：${info.aiReply.is_persion ? '是' : '否'}\n`
         + `- 信用等级：${info.aiReply.credit}\n`
         + `- 评估：${info.aiReply.bargain_level}\n`
         + `- 评分：${info.aiReply.bargain_score}\n`
@@ -263,7 +264,6 @@ async function dingdingMsgNotifyFish(info) {
         + `- 风险提示：\n${info.aiReply.risks.join('\n')}\n`
         + `- 推荐意见：${info.aiReply.recommendation}\n`
         + `- 链接：<${info.addr}>\n`
-        + `- 是否个人卖家：${info.aiReply.is_persion ? '是' : '否'}\n`
         + `- 产品id：${info.productId}\n`
 
     let imgSrc = '> - 详情图片：\n'
@@ -462,6 +462,7 @@ async function getPage(context) {
 function extractJSONByRegex(text) {
     const match = text.match(/\{[\s\S]*\}/);
     if (!match) throw new Error('未匹配到 JSON 对象');
+    console.log('提取到的 JSON 字符串：', match[0]);
     return JSON.parse(match[0]);
 }
 async function AIQuery(page, question, images = []) {
@@ -574,7 +575,7 @@ async function AIQuery(page, question, images = []) {
                 if (replyElement) {
                     let replyText = await replyElement.textContent();
                     replyText = extractJSONByRegex(replyText);
-                    console.log('AI回复：', replyText);
+                    // console.log('AI回复：', replyText);
                     return replyText
                     break;
                 } else {
