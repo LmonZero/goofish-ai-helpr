@@ -6,6 +6,13 @@
 
 ```
 
+# 启动
+
+```
+node AIFish.js xx.json
+
+```
+
 # 说明
 
 playwright 人肉浏览器ai deepseek
