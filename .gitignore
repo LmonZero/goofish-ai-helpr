@@ -1,15 +1,16 @@
 # 忽略单个文件
 config.json
 secret.key
-
+package-lock.json
 # 忽略文件夹（最常用）
-node_modules/
+**/node_modules/
 dist/
 build/
-tmp/
-UserData/
-DB/
-package-lock.json
+**/tmp/
+**/UserData/
+**/DB/
+.qoder/
+tests/
 # 忽略某类文件
 *.log
 *.tmp

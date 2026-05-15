@@ -1,17 +1,16 @@
-【输出格式】
-仅返回以下 JSON 结构，不要添加任何额外文字、代码块标记或说明：
+
+## 输出格式（必须严格JSON，不要有其他文字）：
 {
-  "is_bargain": true,
+  "is_bargain": 0,
   "bargain_level": "超值捡漏/普通优惠/价格正常/偏高",
   "bargain_score": 85,
-  "estimated_market_price_range": "1500-1800 元",
   "condition_assessment": "9成新，边框有细微划痕，屏幕完美，箱说全",
   "identified_brand_model": "Sony WH-1000XM4",
   "key_findings": "综合图片成色与当前二手均价约1600元判断，该售价仅为1200元且配件齐全，是难得的好价。",
   "risks": ["描述仅写‘正常使用痕迹’，未明确说明划痕位置", "无原始发票"],
   "recommendation": "强烈建议立即拍下",
-  "is_persion":true, // 是否是个人卖家
-  "credit":"极好/优秀/良好/差/极差"//卖家信用
+  "is_persion": true,
+  "credit": "极好"
 }
-若无法从图片获取足够信息，对应字段可填 null 或 “无法识别”，但必须保持 JSON 有效。
-现在，请开始分析。
+
+现在请用户提供上述所需信息，你将输出JSON。
