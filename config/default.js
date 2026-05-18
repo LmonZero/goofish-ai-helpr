@@ -43,6 +43,9 @@ module.exports = {
     // 非捡漏商品忽略间隔(天)
     bargainDay: 7,
 
+    // 搜索最大翻页数
+    maxPages: 10,
+
     // 手机端域名（用于生成跳转链接）
     phtoneDomain: 'https://h5.m.goofish.com',
 

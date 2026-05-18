@@ -7,47 +7,49 @@ const BaseAnalyzer = require('./BaseAnalyzer');
  *
  * 核心流程：
  *   1. 打开豆包页面
- *   2. 在输入框填入提问文本 → 触发对话 API
- *   3. 拦截响应（JSON/SSE）→ 提取 AI 回复
+ *   2. 在输入框填入提问文本 → 触发 POST /chat/completion
+ *   3. 拦截 SSE 响应 → 从 CHUNK_DELTA 增量拼接 AI 回复
  *
- * TODO: 待调试填入
- *   - API_PATTERNS 中的正则（通过 debug 脚本抓包确认）
- *   - TRIGGER_SELECTORS 中的选择器（通过浏览器 F12 确认）
- *   - SSE 响应结构解析逻辑（快照模式 vs 增量模式）
+ * SSE 特点：增量模式（非快照模式），事件类型：
+ *   - SSE_HEARTBEAT  心跳，忽略
+ *   - SSE_ACK        确认收到，含 conversation_id
+ *   - FULL_MSG_NOTIFY 用户消息回显，含 cot_switch 深度思考标志
+ *   - STREAM_MSG_NOTIFY AI 回复首帧，含 block_type=10000(正文)/10040(思考)
+ *   - CHUNK_DELTA    增量文本 {"text":"好呀"}，需拼接
+ *   - STREAM_CHUNK   补丁操作(patch_op)，含文本快照和 TTS
+ *   - SSE_REPLY_END  回复结束 end_type=1/2/3
+ *
+ * 编码注意：Playwright SSE 响应存在双重编码 bug，需用 BaseAnalyzer.fixDoubleEncodedSSE() 修复
  */
 class DoubaoAnalyzer extends BaseAnalyzer {
 
     /** 需要监听的 AI 响应 URL 模式 */
     static API_PATTERNS = {
-        // TODO: 通过 debug 脚本抓包确认豆包的对话 API 端点
-        // 示例猜测（需替换）：
-        // chatStream: /doubao\.com\/api\/chat\/stream/,
-        chatStream: /doubao\.com/,  // 宽泛匹配，调试后收窄
+        chatStream: /doubao\.com\/chat\/completion/,
     };
 
     /** 仅用于操作触发的选择器 */
     static TRIGGER_SELECTORS = {
-        // TODO: 通过浏览器 F12 确认以下选择器
-        /** 输入框 */
-        inputArea: '',  // TODO: 填入输入框选择器
-        /** 发送按钮 */
-        sendButton: '',  // TODO: 填入发送按钮选择器
-        /** 深度思考/深度推理开关按钮 */
-        deepThinkToggle: '',  // TODO: 填入深度思考按钮选择器（如有）
+        /** 输入框 — 最内层的 textarea，在 #input-engine-container 容器内 */
+        inputArea: '#input-engine-container textarea',
+        /** 发送按钮 — send-btn-wrapper 是语义化类名，比完整 DOM 路径更稳定 */
+        sendButton: '#input-engine-container .send-btn-wrapper',
+        /** 深度思考/深度推理开关按钮 — 在输入区域内，包含"快速"或"思考"文本的按钮 */
+        deepThinkToggle: 'xpath=//div[@id="input-engine-container"]//button[contains(., "快速") or contains(., "思考")]',
         /** 联网搜索开关按钮 */
-        networkToggle: '',  // TODO: 填入联网搜索按钮选择器（如有）
+        networkToggle: '',  // 这个没有 默认联网
 
         // ======================== 登录相关 ========================
         /** 弹窗关闭按钮 */
-        popupCloseBtn: '',  // TODO: 填入弹窗关闭按钮选择器
-        /** 登录按钮 */
-        loginBtn: '',  // TODO: 填入登录按钮选择器
+        popupCloseBtn: '',  // 没有弹窗需要关闭
+        /** 登录按钮 — XPath 定位，避免 :has-text() 兼容问题 */
+        loginBtn: 'xpath=//button[contains(@class, "semi-button-primary") and contains(., "登录")]',
         /** 二维码所在 iframe（如二维码在 iframe 中） */
-        qrCodeIframe: '',  // TODO: 填入二维码 iframe 选择器（如适用）
+        qrCodeIframe: '',  // 没有这个
         /** 二维码图片或登录面板 */
-        qrCodeImg: '',  // TODO: 填入二维码/登录面板选择器
-        /** 登录成功后出现的头像或其他标志元素 */
-        loginSuccessAvatar: '',  // TODO: 填入登录成功标志选择器
+        qrCodeImg: '#semi-modal-body',
+        /** 登录成功后出现的头像或其他标志元素 — 未登录时登录按钮可见，登录后消失 */
+        loginSuccessAvatar: '',  // 登录按钮没了 就是登录成功
     };
 
     /**
@@ -75,8 +77,8 @@ class DoubaoAnalyzer extends BaseAnalyzer {
     async init() {
         if (!this.context) throw new Error('请先通过 setContext() 注入浏览器上下文');
 
-        const pages = this.context.pages();
-        this._page = pages.length > 0 ? pages[0] : await this.context.newPage();
+        // 始终创建新页面，避免复用其他模块的页面（如 GoofishScraper 的闲鱼页面）
+        this._page = await this.context.newPage();
 
         // 注册 SSE 专用监听（覆盖基类的 json-only 监听）
         this._listenSSEStream(this._page);
@@ -160,20 +162,12 @@ class DoubaoAnalyzer extends BaseAnalyzer {
         const page = this._page;
         const selectors = this.constructor.TRIGGER_SELECTORS;
 
-        // 未配置登录标志选择器，跳过登录流程
-        if (!selectors.loginSuccessAvatar) {
-            console.log('[DoubaoAnalyzer] 未配置登录标志选择器，跳过登录流程');
+        // 1. 检查是否已登录（loginBtn 不可见即表示已登录）
+        const isLoggedIn = await this._checkLoginStatus();
+        if (isLoggedIn) {
+            console.log('[DoubaoAnalyzer] 已登录，跳过登录流程');
             return;
         }
-
-        // 1. 检查是否已登录
-        try {
-            const avatar = page.locator(selectors.loginSuccessAvatar).first();
-            if (await avatar.isVisible({ timeout: 3000 })) {
-                console.log('[DoubaoAnalyzer] 已登录，跳过登录流程');
-                return;
-            }
-        } catch { /* 未登录，继续 */ }
 
         console.log('[DoubaoAnalyzer] 未登录，开始登录流程...');
 
@@ -186,15 +180,47 @@ class DoubaoAnalyzer extends BaseAnalyzer {
         // 4. 保存二维码图片
         await this._saveQRCode();
 
-        // 5. 等待登录成功
+        // 5. 等待登录成功（loginBtn 消失）
         console.log('[DoubaoAnalyzer] 等待扫码登录...');
-        try {
-            const avatar = page.locator(selectors.loginSuccessAvatar).first();
-            await avatar.waitFor({ state: 'visible', timeout: this.loginTimeout });
-            console.log('[DoubaoAnalyzer] 登录成功！');
-        } catch {
-            throw new Error(`[DoubaoAnalyzer] 登录超时（${this.loginTimeout / 1000}s），请重试`);
+        const start = Date.now();
+        while (Date.now() - start < this.loginTimeout) {
+            if (await this._checkLoginStatus()) {
+                console.log('[DoubaoAnalyzer] 登录成功！');
+                return;
+            }
+            await this._sleep(1000);
         }
+        throw new Error(`[DoubaoAnalyzer] 登录超时（${this.loginTimeout / 1000}s），请重试`);
+    }
+
+    /**
+     * 检查当前登录状态
+     * @returns {Promise<boolean>}
+     */
+    async _checkLoginStatus() {
+        const selectors = this.constructor.TRIGGER_SELECTORS;
+
+        // 优先：配置了 loginSuccessAvatar 且可见
+        if (selectors.loginSuccessAvatar) {
+            try {
+                const el = this._page.locator(selectors.loginSuccessAvatar).first();
+                if (await el.isVisible({ timeout: 2000 })) return true;
+            } catch { /* 未找到，继续检查 */ }
+        }
+
+        // 兜底：loginBtn 存在且可见 → 未登录；存在但不可见或不存在 → 已登录
+        if (selectors.loginBtn) {
+            try {
+                const loginBtn = this._page.locator(selectors.loginBtn).first();
+                const count = await loginBtn.count();
+                if (count === 0) return true;   // 登录按钮不存在 → 已登录
+                return !(await loginBtn.isVisible());  // 存在但不可见 → 已登录
+            } catch {
+                return false;  // 异常时保守判断为未登录
+            }
+        }
+
+        return false;
     }
 
     /**
@@ -311,6 +337,13 @@ class DoubaoAnalyzer extends BaseAnalyzer {
 
     /**
      * 切换深度思考/深度推理模式
+     *
+     * 豆包的深度思考是一个 Radix UI 下拉菜单（非简单开关）：
+     *   - 触发器：button[data-slot="dropdown-menu-trigger"]
+     *   - 选项："快速"(data-selected=false) / "思考"(data-selected=true/false)
+     *   - 开启深度思考：点击触发器 → 点击 "思考" 菜单项
+     *   - 关闭深度思考：点击触发器 → 点击 "快速" 菜单项
+     *
      * @param {boolean} enable
      */
     async _toggleDeepThink(enable) {
@@ -319,22 +352,37 @@ class DoubaoAnalyzer extends BaseAnalyzer {
 
         const page = this._page;
         try {
-            const el = page.locator(selector).first();
-            if (!await el.isVisible({ timeout: 2000 })) {
+            const trigger = page.locator(selector).first();
+            if (!await trigger.isVisible({ timeout: 3000 })) {
                 console.log('[DoubaoAnalyzer] 深度思考按钮不可见，跳过');
                 return;
             }
 
-            const classAttr = await el.getAttribute('class').catch(() => null);
-            const isCurrentlyOn = classAttr && classAttr.includes('selected');
+            // 1. 点击触发器，打开下拉菜单
+            await trigger.click();
+            await this._humanDelay(400, 700);
 
-            if (enable !== isCurrentlyOn) {
-                await el.click();
-                await this._humanDelay(300, 600);
-                console.log(`[DoubaoAnalyzer] 深度思考: ${enable ? '已开启' : '已关闭'}`);
-            } else {
+            // 2. 找到 "思考" 菜单项，检查当前选中状态
+            const thinkItem = page.locator('div[role="menuitem"]').filter({ hasText: '思考' }).first();
+            const isSelected = await thinkItem.getAttribute('data-selected').catch(() => 'false');
+
+            if ((enable && isSelected === 'true') || (!enable && isSelected !== 'true')) {
                 console.log(`[DoubaoAnalyzer] 深度思考: 已是${enable ? '开启' : '关闭'}状态，无需切换`);
+                await page.keyboard.press('Escape');
+                await this._humanDelay(200, 400);
+                return;
             }
+
+            // 3. 切换到目标模式
+            if (enable) {
+                await thinkItem.click();
+                console.log('[DoubaoAnalyzer] 深度思考: 已开启');
+            } else {
+                const quickItem = page.locator('div[role="menuitem"]').filter({ hasText: '快速' }).first();
+                await quickItem.click();
+                console.log('[DoubaoAnalyzer] 深度思考: 已关闭');
+            }
+            await this._humanDelay(300, 600);
         } catch (e) {
             console.log(`[DoubaoAnalyzer] 深度思考切换失败: ${e.message}`);
         }
@@ -448,6 +496,9 @@ class DoubaoAnalyzer extends BaseAnalyzer {
 
     /**
      * SSE 专用监听器（覆盖基类的 json-only 逻辑）
+     *
+     * 豆包 SSE 响应存在双重编码 bug，需用 BaseAnalyzer.fixDoubleEncodedSSE() 修复
+     *
      * @param {Page} page
      */
     _listenSSEStream(page) {
@@ -457,17 +508,36 @@ class DoubaoAnalyzer extends BaseAnalyzer {
             const url = response.url();
             try {
                 const contentType = response.headers()['content-type'] || '';
+                const isSSE = contentType.includes('text/event-stream');
+                const isJson = contentType.includes('application/json') || contentType.includes('text/json');
 
+                // 调试：打印所有 SSE/JSON 响应的 URL（调试用，平时注释掉）
+                // if (isSSE || isJson) {
+                //     console.log(`[DoubaoAnalyzer] 响应: ${response.status()} ${isSSE ? 'SSE' : 'JSON'} ${url.substring(0, 150)}`);
+                // }
+
+                let matched = false;
                 for (const [name, pattern] of Object.entries(patterns)) {
                     if (!pattern.test(url)) continue;
+                    matched = true;
 
-                    if (contentType.includes('text/event-stream')) {
-                        const text = await response.text().catch(() => null);
+                    if (isSSE) {
+                        // SSE 流 — 读取 Buffer 后修复双重编码
+                        const buf = await response.body().catch(() => null);
+                        let text = null;
+                        if (buf) {
+                            const doubleEncoded = buf.toString('utf-8');
+                            text = BaseAnalyzer.fixDoubleEncodedSSE(doubleEncoded);
+                        }
+                        if (!text) {
+                            text = await response.text().catch(() => null);
+                            if (text) text = BaseAnalyzer.fixDoubleEncodedSSE(text);
+                        }
                         if (text) {
                             this._apiResponses.set(name, { url, body: text, timestamp: Date.now() });
                             console.log(`[DoubaoAnalyzer] SSE流捕获 ${name}: ${url.substring(0, 120)}...`);
                         }
-                    } else if (contentType.includes('application/json') || contentType.includes('text/json')) {
+                    } else if (isJson) {
                         const body = await response.json().catch(() => null);
                         if (body) {
                             this._apiResponses.set(name, { url, body, timestamp: Date.now() });
@@ -476,8 +546,8 @@ class DoubaoAnalyzer extends BaseAnalyzer {
                     }
                     break;
                 }
-            } catch {
-                // 忽略
+            } catch (e) {
+                console.log(`[DoubaoAnalyzer] 响应处理异常: ${e.message}`);
             }
         });
     }
@@ -485,7 +555,7 @@ class DoubaoAnalyzer extends BaseAnalyzer {
     /**
      * 等待响应完成并提取 AI 回复
      * @param {string} [question]
-     * @returns {Promise<{answer: string, think: string, conversationId: string}|null>}
+     * @returns {Promise<{answer: string, think: string, conversationId: string, hasDeepThink: boolean, endType: string}|null>}
      */
     async _waitForStreamComplete(question) {
         const cached = await this.waitForApiResponse('chatStream', this.streamTimeout);
@@ -494,15 +564,13 @@ class DoubaoAnalyzer extends BaseAnalyzer {
             return null;
         }
 
-        // TODO: 根据调试结果实现豆包的响应解析逻辑
-        // 可能是 SSE 快照模式（类似智谱清言）或增量模式
         const body = cached.body;
 
         if (typeof body === 'string') {
-            // SSE 文本 — 需要根据豆包的实际格式解析
-            return this._extractReplyFromSSE(body);
+            const extracted = this._extractReplyFromSSE(body);
+            console.log(`[DoubaoAnalyzer] AI 回复完成 (conversation: ${extracted.conversationId}, data行数: ${extracted.dataLineCount})`);
+            return extracted;
         } else {
-            // JSON 响应 — 直接提取
             return this._extractReplyFromJSON(body);
         }
     }
@@ -510,72 +578,165 @@ class DoubaoAnalyzer extends BaseAnalyzer {
     /**
      * 从 SSE 全文本中提取 AI 回复内容
      *
-     * TODO: 根据调试结果调整解析逻辑
-     * 豆包的 SSE 格式待确认，可能是：
-     *   - 快照模式（类似智谱清言）：每条 data 包含完整文本，只取最后一条
-     *   - 增量模式：每条 data 只包含新增文本，需要拼接
+     * 豆包 SSE 是增量模式（非快照模式）：
+     *   - 正文：拼接 CHUNK_DELTA 的 text + STREAM_CHUNK (patch_object=1) 无 parent_id 的 text
+     *   - 思考：STREAM_CHUNK (patch_object=1) 中 block_type=10000 + parent_id 指向 thinking_block
+     *          + CHUNK_DELTA（思考阶段内）
+     *   - conversation_id：从 SSE_ACK 或 STREAM_MSG_NOTIFY 提取
+     *   - 深度思考标志：从 FULL_MSG_NOTIFY 的 ext.cot_switch 或 ext.use_deep_think 检测
+     *
+     * 深度思考数据结构：
+     *   - STREAM_MSG_NOTIFY 出现 block_type=10040 (thinking_block)，含 block_id
+     *   - 思考文本通过两条通道：
+     *     a) STREAM_CHUNK (patch_object=1) 中 block_type=10000 + parent_id → text + summary
+     *     b) CHUNK_DELTA（thinkingPhaseActive 时）
+     *   - 思考结束：STREAM_CHUNK 中 block_type=10040 的 is_finish=true
      *
      * @param {string} sseText
-     * @returns {{answer: string, think: string, conversationId: string, status: string, dataLineCount: number}}
+     * @returns {{answer: string, think: string, thinkSummary: string, conversationId: string, hasDeepThink: boolean, endType: string, dataLineCount: number}}
      */
     _extractReplyFromSSE(sseText) {
-        const dataLines = sseText.split('\n').filter(l => l.startsWith('data:'));
+        const lines = sseText.split('\n');
         let conversationId = '';
-        let lastStatus = '';
         let answer = '';
-        let think = '';
+        let thinkText = '';
+        let thinkSummary = '';
+        let hasDeepThink = false;
+        let endType = '';
+        let messageId = '';
+        let dataLineCount = 0;
 
-        // TODO: 根据豆包实际 SSE 结构调整以下解析逻辑
-        for (const line of dataLines) {
-            const jsonStr = line.replace(/^data:\s*/, '').trim();
-            if (!jsonStr || jsonStr === '[DONE]') continue;
-            try {
-                const obj = JSON.parse(jsonStr);
+        // 深度思考状态追踪
+        let thinkingBlockId = '';        // block_type=10040 的 block_id
+        let thinkingPhaseActive = false; // 思考阶段是否进行中
 
-                // 通用字段提取（需要根据豆包实际结构调整）
-                if (obj.conversation_id) conversationId = obj.conversation_id;
-                if (obj.conversationId) conversationId = obj.conversationId;
-                if (obj.status) lastStatus = obj.status;
+        // eventType 需跨行保持，因为 event: 和 data: 是分开的两行
+        let currentEventType = '';
 
-                // 尝试多种常见的回复字段结构
-                // 结构1: { choices: [{ delta: { content: "..." } }] }（OpenAI 兼容格式）
-                if (obj.choices && Array.isArray(obj.choices)) {
-                    for (const choice of obj.choices) {
-                        if (choice.delta?.content) answer += choice.delta.content;
-                        if (choice.delta?.reasoning_content) think += choice.delta.reasoning_content;
+        for (const line of lines) {
+            if (line.startsWith('event:')) {
+                currentEventType = line.replace(/^event:\s*/, '').trim();
+                continue;
+            }
+            if (!line.startsWith('data:')) continue;
+            dataLineCount++;
+
+            const dataJson = line.replace(/^data:\s*/, '').trim();
+            if (!dataJson) continue;
+            let obj;
+            try { obj = JSON.parse(dataJson); } catch { continue; }
+
+            // ---- SSE_ACK: 提取 conversation_id ----
+            if (currentEventType === 'SSE_ACK') {
+                const ackMeta = obj.ack_client_meta;
+                if (ackMeta?.conversation_id) conversationId = ackMeta.conversation_id;
+            }
+
+            // ---- FULL_MSG_NOTIFY: 检测深度思考标志 ----
+            if (currentEventType === 'FULL_MSG_NOTIFY') {
+                if (obj.message?.ext?.cot_switch === '1' || obj.message?.ext?.use_deep_think === '1') {
+                    hasDeepThink = true;
+                }
+            }
+
+            // ---- STREAM_MSG_NOTIFY: AI 回复首帧 ----
+            if (currentEventType === 'STREAM_MSG_NOTIFY') {
+                const meta = obj.meta;
+                if (meta?.conversation_id) conversationId = meta.conversation_id;
+                if (meta?.message_id) messageId = meta.message_id;
+
+                const content = obj.content;
+                if (content?.content_block && Array.isArray(content.content_block)) {
+                    for (const block of content.content_block) {
+                        // block_type=10000 正文首帧（无 parent_id）
+                        if (block.block_type === 10000 && !block.parent_id && block.content?.text_block?.text) {
+                            answer += block.content.text_block.text;
+                        }
+                        // block_type=10040 深度思考容器块
+                        if (block.block_type === 10040) {
+                            hasDeepThink = true;
+                            thinkingBlockId = block.block_id || '';
+                            thinkingPhaseActive = true;
+                        }
                     }
                 }
+            }
 
-                // 结构2: { message: { content: "..." } }
-                if (obj.message?.content) answer = obj.message.content;
+            // ---- CHUNK_DELTA: 增量文本，按阶段路由 ----
+            if (currentEventType === 'CHUNK_DELTA') {
+                if (obj.text) {
+                    if (thinkingPhaseActive) {
+                        thinkText += obj.text;
+                    } else {
+                        answer += obj.text;
+                    }
+                }
+            }
 
-                // 结构3: { data: { text: "..." } }
-                if (obj.data?.text) answer = obj.data.text;
+            // ---- STREAM_CHUNK: 补丁操作 ----
+            if (currentEventType === 'STREAM_CHUNK') {
+                if (obj.patch_op && Array.isArray(obj.patch_op)) {
+                    for (const patch of obj.patch_op) {
+                        // 只处理 content_block 补丁（patch_object=1）
+                        if (patch.patch_object !== 1) continue;
+                        if (!patch.patch_value?.content_block) continue;
 
-            } catch { /* 忽略非 JSON 行 */ }
+                        for (const block of patch.patch_value.content_block) {
+                            // block_type=10040: 思考容器块生命周期
+                            if (block.block_type === 10040) {
+                                if (block.is_finish) {
+                                    thinkingPhaseActive = false;
+                                }
+                            }
+
+                            // block_type=10000: 文本块
+                            if (block.block_type === 10000 && block.content?.text_block) {
+                                const tb = block.content.text_block;
+                                const text = tb.text || '';
+
+                                if (block.parent_id && block.parent_id === thinkingBlockId) {
+                                    // 思考子块（parent_id 指向 thinking_block）
+                                    if (text) thinkText += text;
+                                    if (tb.summary) thinkSummary = tb.summary;
+                                } else if (!block.parent_id) {
+                                    // 回答块（无 parent_id）
+                                    if (text) answer += text;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ---- SSE_REPLY_END: 结束标志 ----
+            if (currentEventType === 'SSE_REPLY_END') {
+                endType = obj.end_type;
+            }
         }
 
         return {
-            answer,
-            think,
+            answer: answer.replace(/\uFFFD/g, ''),
+            think: thinkText.replace(/\uFFFD/g, '') || (hasDeepThink ? '(深度思考内容待提取)' : ''),
+            thinkSummary,
             conversationId,
-            status: lastStatus,
-            dataLineCount: dataLines.length,
+            hasDeepThink,
+            endType,
+            dataLineCount,
         };
     }
 
     /**
-     * 从 JSON 响应中提取 AI 回复内容
+     * 从 JSON 响应中提取 AI 回复内容（非 SSE 场景的兜底）
      * @param {object} body
-     * @returns {{answer: string, think: string, conversationId: string, status: string}}
+     * @returns {{answer: string, think: string, conversationId: string, hasDeepThink: boolean, endType: string}}
      */
     _extractReplyFromJSON(body) {
-        // TODO: 根据豆包实际 JSON 结构调整
         return {
             answer: body.data?.text || body.message?.content || body.content || '',
             think: '',
             conversationId: body.conversation_id || body.conversationId || '',
-            status: body.status || '',
+            hasDeepThink: false,
+            endType: '',
         };
     }
 

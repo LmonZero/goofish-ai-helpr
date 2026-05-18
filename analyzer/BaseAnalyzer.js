@@ -158,6 +158,61 @@ class BaseAnalyzer {
     // ======================== 工具方法 ========================
 
     /**
+     * 修复 Playwright SSE 双重编码问题
+     *
+     * Playwright/Chromium 将 SSE 响应的原始 UTF-8 字节按 Windows-1252 (cp1252) 解码，
+     * 再 UTF-8 编码一次。此方法反向操作：将双重编码字符串的每个 Unicode 码点
+     * 按 cp1252 反向映射回原始字节，再用 UTF-8 正确解码。
+     *
+     * 不能简单用 iconv.encode(str,'win1252')，因为 cp1252 在
+     * 0x81,0x8D,0x8F,0x90,0x9D 处未定义，iconv 会输出 '?' 替代。
+     *
+     * @param {string} doubleEncoded - 双重编码的 SSE 文本
+     * @returns {string} 正确解码的 UTF-8 文本
+     */
+    static fixDoubleEncodedSSE(doubleEncoded) {
+        // cp1252 0x80-0x9F 区间的特殊映射
+        const cp1252Special = {
+            0x80: 0x20AC, 0x82: 0x201A, 0x83: 0x0192, 0x84: 0x201E, 0x85: 0x2026,
+            0x86: 0x2020, 0x87: 0x2021, 0x88: 0x02C6, 0x89: 0x2030, 0x8A: 0x0160,
+            0x8B: 0x2039, 0x8C: 0x0152, 0x8E: 0x017D, 0x91: 0x2018, 0x92: 0x2019,
+            0x93: 0x201C, 0x94: 0x201D, 0x95: 0x2022, 0x96: 0x2013, 0x97: 0x2014,
+            0x98: 0x02DC, 0x99: 0x2122, 0x9A: 0x0161, 0x9B: 0x203A, 0x9C: 0x0153,
+            0x9E: 0x017E, 0x9F: 0x0178
+        };
+
+        // 构建 Unicode 码点 → cp1252 字节值 的反向映射表
+        const unicodeToByte = {};
+        for (const [byte, cp] of Object.entries(cp1252Special)) {
+            unicodeToByte[cp] = parseInt(byte);
+        }
+        for (let i = 0; i <= 0xFF; i++) {
+            if (i >= 0x80 && i <= 0x9F && !cp1252Special[i]) continue;
+            const cp = cp1252Special[i] || i;
+            if (unicodeToByte[cp] === undefined) unicodeToByte[cp] = i;
+        }
+        // cp1252 未定义字节也映射回去（C1 控制字符）
+        for (let i = 0x80; i <= 0x9F; i++) {
+            if (!cp1252Special[i] && unicodeToByte[i] === undefined) {
+                unicodeToByte[i] = i;
+            }
+        }
+
+        const rawBytes = [];
+        for (const ch of doubleEncoded) {
+            const cp = ch.charCodeAt(0);
+            const byte = unicodeToByte[cp];
+            if (byte !== undefined) {
+                rawBytes.push(byte);
+            } else {
+                const charBuf = Buffer.from(ch, 'utf-8');
+                for (const b of charBuf) rawBytes.push(b);
+            }
+        }
+        return Buffer.from(rawBytes).toString('utf-8');
+    }
+
+    /**
      * 从 AI 回复文本中提取 JSON 对象
      * @param {string} text
      * @returns {object}
@@ -172,39 +227,15 @@ class BaseAnalyzer {
      * 识别二维码并在终端打印
      *
      * 通用工具方法，适用于所有需要扫码登录的 AI 平台子类。
-     * 依赖：jimp、qrcode-reader、qrcode-terminal
+     * 已提取到 lib/qr-utils.js 共用，此处保留接口兼容。
      *
      * @param {string} imagePath - 二维码图片路径
      * @returns {Promise<boolean>} 是否识别成功
      */
     async decodeAndPrintQR(imagePath) {
-        const { Jimp } = require('jimp');
-        const QrCode = require('qrcode-reader');
-        const qrcodeTerminal = require('qrcode-terminal');
-
-        try {
-            const image = await Jimp.read(imagePath);
-            const qr = new QrCode();
-
-            return new Promise((resolve) => {
-                qr.callback = (err, value) => {
-                    if (err) {
-                        console.log(`[BaseAnalyzer] 二维码识别失败: ${err.message}`);
-                        resolve(false);
-                        return;
-                    }
-                    console.log(`[BaseAnalyzer] 二维码链接: ${value.result}`);
-                    qrcodeTerminal.generate(value.result, { small: true }, (code) => {
-                        console.log(code);
-                    });
-                    resolve(true);
-                };
-                qr.decode(image.bitmap);
-            });
-        } catch (e) {
-            console.log(`[BaseAnalyzer] 二维码读取异常: ${e.message}`);
-            return false;
-        }
+        const qrUtils = require('../lib/qr-utils');
+        const result = await qrUtils.decodeAndPrintQR(imagePath);
+        return result.success;
     }
 
     _sleep(ms) {

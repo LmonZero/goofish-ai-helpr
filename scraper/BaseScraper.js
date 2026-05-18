@@ -1,5 +1,6 @@
 const path = require('path');
 const { chromium } = require('patchright');
+const antiDetectScript = require('../lib/anti-detect');
 
 /**
  * 数据采集器抽象基类
@@ -39,7 +40,13 @@ class BaseScraper {
     // ======================== 生命周期 ========================
 
     /**
-     * 初始化浏览器持久化上下文
+     * 初始化浏览器持久化上下文 + 注入反检测脚本
+     *
+     * 反检测分两层：
+     *   1. patchright 底层已消除 CDP 自动化特征（navigator.webdriver、Runtime.enable 泄露等）
+     *   2. context.addInitScript 补充指纹伪装：Canvas/WebGL/Audio/Screen/Plugins 等
+     *      上下文级别注入 → 该上下文中所有页面自动生效
+     *
      * @returns {Promise<BrowserContext>}
      */
     async init() {
@@ -55,6 +62,10 @@ class BaseScraper {
             colorScheme: 'light',
             extraHTTPHeaders: { 'accept-language': 'zh-CN,zh;q=0.9' },
         });
+
+        // 上下文级别注入反检测脚本 → 所有页面自动生效
+        await this.context.addInitScript(antiDetectScript);
+
         return this.context;
     }
 
@@ -72,214 +83,15 @@ class BaseScraper {
     // ======================== 页面与反检测 ========================
 
     /**
-     * 创建新页面并注入反检测脚本
+     * 创建新页面
      *
-     * 反检测分两层：
-     *   1. patchright 底层已消除 CDP 自动化特征（navigator.webdriver、Runtime.enable 泄露等）
-     *   2. addInitScript 补充指纹伪装：Canvas/WebGL/Audio/Screen/Plugins 等
+     * 反检测脚本已在 init() 中通过 context.addInitScript() 注入，
+     * 该上下文中的所有页面自动生效，无需再次注入。
      *
      * @returns {Promise<Page>}
      */
     async newPage() {
-        const page = await this.context.newPage();
-
-        await page.addInitScript(() => {
-            // ===== navigator 属性伪装 =====
-            Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en'], configurable: true });
-            Object.defineProperty(navigator, 'platform', { get: () => 'Win32', configurable: true });
-            Object.defineProperty(navigator, 'vendor', { get: () => 'Google Inc.', configurable: true });
-            Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8, configurable: true });
-            Object.defineProperty(navigator, 'deviceMemory', { get: () => 8, configurable: true });
-
-            // ===== plugins 伪装（真实 Chrome 插件结构）=====
-            const fakePlugins = [
-                { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
-                { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai', description: '' },
-                { name: 'Native Client', filename: 'internal-nacl-plugin', description: '' },
-            ];
-            const pluginArray = Object.create(PluginArray.prototype);
-            for (let i = 0; i < fakePlugins.length; i++) {
-                const p = fakePlugins[i];
-                const plugin = Object.create(Plugin.prototype);
-                Object.defineProperties(plugin, {
-                    name: { get: () => p.name, enumerable: true },
-                    filename: { get: () => p.filename, enumerable: true },
-                    description: { get: () => p.description, enumerable: true },
-                    length: { get: () => 0, enumerable: true },
-                });
-                Object.defineProperty(pluginArray, i, { get: () => plugin, enumerable: true });
-            }
-            Object.defineProperties(navigator, {
-                plugins: { get: () => pluginArray, configurable: true },
-                mimeTypes: { get: () => Object.create(MimeTypeArray.prototype), configurable: true },
-            });
-
-            // ===== Chrome 运行时伪装 =====
-            // 注意：loadTimes/csi 在 Chrome 71+ 已弃用，新浏览器中不存在这些 API
-            // 只有在页面本身访问时才注入，避免"不该有的反而有"的检测
-            if (!window.chrome) {
-                window.chrome = {};
-            }
-            if (!window.chrome.runtime) {
-                window.chrome.runtime = { connect: function () { }, sendMessage: function () { } };
-            }
-            if (!window.chrome.app) {
-                window.chrome.app = { isInstalled: false };
-            }
-
-            // ===== Permissions API 伪装 =====
-            const originalQuery = window.navigator.permissions?.query;
-            if (originalQuery) {
-                window.navigator.permissions.query = (parameters) => (
-                    parameters.name === 'notifications'
-                        ? Promise.resolve({ state: Notification.permission })
-                        : originalQuery.call(window.navigator.permissions, parameters)
-                );
-            }
-
-            // ===== WebGL 渲染器伪装（避免 Headless 特征）=====
-            const getParameterOrig = WebGLRenderingContext.prototype.getParameter;
-            WebGLRenderingContext.prototype.getParameter = function (param) {
-                // UNMASKED_VENDOR_WEBGL
-                if (param === 37445) return 'Google Inc. (NVIDIA)';
-                // UNMASKED_RENDERER_WEBGL
-                if (param === 37446) return 'ANGLE (NVIDIA, NVIDIA GeForce GTX 1660 SUPER Direct3D11 vs_5_0 ps_5_0, D3D11)';
-                return getParameterOrig.call(this, param);
-            };
-            if (typeof WebGL2RenderingContext !== 'undefined') {
-                const getParameter2Orig = WebGL2RenderingContext.prototype.getParameter;
-                WebGL2RenderingContext.prototype.getParameter = function (param) {
-                    if (param === 37445) return 'Google Inc. (NVIDIA)';
-                    if (param === 37446) return 'ANGLE (NVIDIA, NVIDIA GeForce GTX 1660 SUPER Direct3D11 vs_5_0 ps_5_0, D3D11)';
-                    return getParameter2Orig.call(this, param);
-                };
-            }
-
-            // ===== Canvas 指纹加噪（toDataURL + toBlob 保持一致）=====
-            const _canvasNoise = (ctx, w, h) => {
-                try {
-                    const imgData = ctx.getImageData(0, 0, w, h);
-                    for (let i = 0; i < imgData.data.length; i += 4 * 37) {
-                        imgData.data[i] = Math.max(0, Math.min(255, imgData.data[i] + (Math.random() > 0.5 ? 1 : -1)));
-                    }
-                    ctx.putImageData(imgData, 0, 0);
-                } catch (_) { }
-            };
-            const origToDataURL = HTMLCanvasElement.prototype.toDataURL;
-            HTMLCanvasElement.prototype.toDataURL = function () {
-                if (this.width === 0 || this.height === 0) return origToDataURL.apply(this, arguments);
-                const ctx = this.getContext('2d');
-                if (ctx) _canvasNoise(ctx, this.width, this.height);
-                return origToDataURL.apply(this, arguments);
-            };
-            const origToBlob = HTMLCanvasElement.prototype.toBlob;
-            HTMLCanvasElement.prototype.toBlob = function () {
-                if (this.width === 0 || this.height === 0) return origToBlob.apply(this, arguments);
-                const ctx = this.getContext('2d');
-                if (ctx) _canvasNoise(ctx, this.width, this.height);
-                return origToBlob.apply(this, arguments);
-            };
-
-            // ===== iframe contentWindow 检测修补 =====
-            const origContentWindow = Object.getOwnPropertyDescriptor(HTMLIFrameElement.prototype, 'contentWindow');
-            Object.defineProperty(HTMLIFrameElement.prototype, 'contentWindow', {
-                get: function () {
-                    const result = origContentWindow?.get?.call(this);
-                    if (result) {
-                        try { result.navigator; } catch (e) { return null; }
-                    }
-                    return result;
-                },
-                configurable: true,
-            });
-
-            // ===== 屏幕与窗口属性（修复 headless 特征）=====
-            if (screen.width === 0 || screen.height === 0) {
-                Object.defineProperties(screen, {
-                    width: { get: () => 1920, configurable: true },
-                    height: { get: () => 1080, configurable: true },
-                    availWidth: { get: () => 1920, configurable: true },
-                    availHeight: { get: () => 1040, configurable: true },
-                    colorDepth: { get: () => 24, configurable: true },
-                    pixelDepth: { get: () => 24, configurable: true },
-                });
-            }
-
-            // ===== 外部窗口尺寸修正 =====
-            if (window.outerWidth === 0) {
-                Object.defineProperty(window, 'outerWidth', { get: () => window.innerWidth, configurable: true });
-            }
-            if (window.outerHeight === 0) {
-                Object.defineProperty(window, 'outerHeight', { get: () => window.innerHeight + 85, configurable: true });
-            }
-
-            // ===== AudioContext 指纹加噪 =====
-            const audioCtx = window.AudioContext || window.webkitAudioContext;
-            if (audioCtx) {
-                const origGetFloatFreqData = AnalyserNode.prototype.getFloatFrequencyData;
-                AnalyserNode.prototype.getFloatFrequencyData = function (array) {
-                    origGetFloatFreqData.call(this, array);
-                    for (let i = 0; i < array.length; i++) {
-                        array[i] = array[i] + (Math.random() - 0.5) * 0.001;
-                    }
-                };
-                const origGetChannelData = AudioBuffer.prototype.getChannelData;
-                AudioBuffer.prototype.getChannelData = function (channel) {
-                    const data = origGetChannelData.call(this, channel);
-                    for (let i = 0; i < data.length; i += 100) {
-                        data[i] = data[i] + (Math.random() - 0.5) * 0.0001;
-                    }
-                    return data;
-                };
-            }
-
-            // ===== navigator.connection 伪装 =====
-            if (!navigator.connection) {
-                Object.defineProperty(navigator, 'connection', {
-                    get: () => ({
-                        effectiveType: '4g',
-                        rtt: 50,
-                        downlink: 10,
-                        saveData: false,
-                        onchange: null,
-                        type: 'wifi',
-                    }),
-                    configurable: true,
-                });
-            }
-
-            // ===== navigator.getBattery 伪装（避免 headless 无 battery API 暴露）=====
-            if (!navigator.getBattery) {
-                navigator.getBattery = () => Promise.resolve({
-                    charging: true,
-                    chargingTime: 0,
-                    dischargingTime: Infinity,
-                    level: 1,
-                    addEventListener: function () { },
-                    removeEventListener: function () { },
-                    dispatchEvent: function () { return true; },
-                });
-            }
-
-            // ===== 阻止 toString 检测（检查函数是否被修改过）=====
-            const _origToString = Function.prototype.toString;
-            const _patchedFns = new WeakSet();
-            const _markPatched = (fn) => { _patchedFns.add(fn); return fn; };
-            Function.prototype.toString = function () {
-                return _patchedFns.has(this) ? `function ${this.name || ''}() { [native code] }` : _origToString.call(this);
-            };
-            // 将所有伪装的函数标记
-            _markPatched(WebGLRenderingContext.prototype.getParameter);
-            _markPatched(HTMLCanvasElement.prototype.toDataURL);
-            _markPatched(HTMLCanvasElement.prototype.toBlob);
-            if (window.AudioContext || window.webkitAudioContext) {
-                _markPatched(AnalyserNode.prototype.getFloatFrequencyData);
-                _markPatched(AudioBuffer.prototype.getChannelData);
-            }
-            _markPatched(Function.prototype.toString);
-        });
-
-        return page;
+        return await this.context.newPage();
     }
 
     // ======================== API 监听基础设施 ========================

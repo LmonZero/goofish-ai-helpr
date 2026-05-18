@@ -71,8 +71,8 @@ class ZhiPuAnalyzer extends BaseAnalyzer {
     async init() {
         if (!this.context) throw new Error('请先通过 setContext() 注入浏览器上下文');
 
-        const pages = this.context.pages();
-        this._page = pages.length > 0 ? pages[0] : await this.context.newPage();
+        // 始终创建新页面，避免复用其他模块的页面（如 GoofishScraper 的闲鱼页面）
+        this._page = await this.context.newPage();
 
         // 注册 SSE 专用监听（覆盖基类的 json-only 监听）
         this._listenSSEStream(this._page);
