@@ -18,8 +18,13 @@ const path = require('path');
 const DEFAULT_DB_PATH = path.join(__dirname, '..', 'DB', 'xianyu.db');
 
 class XianyuDB {
-    constructor(dbPath) {
+    /**
+     * @param {string} [dbPath] - SQLite 文件路径
+     * @param {number} [freshTTLDays=30] - 数据新鲜度阈値（天）
+     */
+    constructor(dbPath, freshTTLDays) {
         this.dbPath = dbPath || DEFAULT_DB_PATH;
+        this.freshTTL = (freshTTLDays > 0 ? freshTTLDays : 30) * 24 * 3600;
         this.db = null;
     }
 
@@ -64,7 +69,7 @@ class XianyuDB {
 
             CREATE TABLE IF NOT EXISTS t_product (
                 item_id         INTEGER PRIMARY KEY,
-                seller_id       INTEGER DEFAULT 0,
+                seller_id       INTEGER DEFAULT NULL,
                 title           TEXT    DEFAULT '',
                 price           TEXT    DEFAULT '',
                 original_price  TEXT    DEFAULT '',
@@ -159,47 +164,72 @@ class XianyuDB {
             CREATE INDEX IF NOT EXISTS idx_analysis_addr ON t_analysis(addr);
 
             CREATE INDEX IF NOT EXISTS idx_product_seller ON t_product(seller_id);
+            CREATE INDEX IF NOT EXISTS idx_product_keyword ON t_product(keyword);
             CREATE INDEX IF NOT EXISTS idx_product_image_item ON t_product_image(item_id);
             CREATE INDEX IF NOT EXISTS idx_seller_item_seller ON t_seller_item(seller_id);
             CREATE INDEX IF NOT EXISTS idx_seller_rating_seller ON t_seller_rating(seller_id);
             CREATE INDEX IF NOT EXISTS idx_search_log_keyword ON t_search_log(keyword);
         `);
+
+        // ---- 增量迁移：添加遗漏字段（IF NOT EXISTS 兼容） ----
+        const alterMigrations = [
+            // t_product 新增字段
+            'ALTER TABLE t_product ADD COLUMN location TEXT DEFAULT ""',
+            'ALTER TABLE t_product ADD COLUMN area TEXT DEFAULT ""',
+            'ALTER TABLE t_product ADD COLUMN condition_name TEXT DEFAULT ""',
+            'ALTER TABLE t_product ADD COLUMN tag_list TEXT DEFAULT ""',
+            'ALTER TABLE t_product ADD COLUMN keyword TEXT DEFAULT ""',
+            // t_seller_item 新增字段
+            'ALTER TABLE t_seller_item ADD COLUMN sold_cnt INTEGER DEFAULT 0',
+            'ALTER TABLE t_seller_item ADD COLUMN is_sold INTEGER DEFAULT 0',
+            'ALTER TABLE t_seller_item ADD COLUMN area TEXT DEFAULT ""',
+            'ALTER TABLE t_seller_item ADD COLUMN category_id INTEGER DEFAULT 0',
+            'ALTER TABLE t_seller_item ADD COLUMN status TEXT DEFAULT ""',
+            // t_seller_rating 新增字段
+            'ALTER TABLE t_seller_rating ADD COLUMN seller_reply TEXT DEFAULT ""',
+            'ALTER TABLE t_seller_rating ADD COLUMN images TEXT DEFAULT ""',
+            'ALTER TABLE t_seller_rating ADD COLUMN is_anonymous INTEGER DEFAULT 0',
+            // t_analysis 字段类型修正
+            'ALTER TABLE t_analysis ADD COLUMN credit_text TEXT DEFAULT ""',
+        ];
+        for (const sql of alterMigrations) {
+            try { this.db.exec(sql); } catch (_) { /* 列已存在则忽略 */ }
+        }
     }
 
     // ======================== 新鲜度检查 ========================
 
     /**
-     * 一个月的秒数阈值
-     */
-    static get FRESH_TTL() { return 30 * 24 * 3600; }  // 30天
-
-    /**
-     * 检查商品数据是否新鲜（存在且 updated_at 在30天内）
+     * 检查商品数据是否新鲜（存在且 updated_at 在 freshTTL 内）
      * @param {string|number} itemId
      * @returns {{ fresh: boolean, exists: boolean, product: object|null, ageDays: number }}
      */
     checkProductFresh(itemId) {
         const row = this.db.prepare('SELECT * FROM t_product WHERE item_id = ?').get(itemId);
         if (!row) return { fresh: false, exists: false, product: null, ageDays: Infinity };
+        // updated_at=0 表示数据不完整，需要重新爬取
+        if (!row.updated_at) return { fresh: false, exists: true, product: row, ageDays: -1 };
         const now = Math.floor(Date.now() / 1000);
-        const ageSec = now - (row.updated_at || 0);
+        const ageSec = now - row.updated_at;
         const ageDays = Math.floor(ageSec / 86400);
-        const fresh = ageSec <= XianyuDB.FRESH_TTL;
+        const fresh = ageSec <= this.freshTTL;
         return { fresh, exists: true, product: row, ageDays };
     }
 
     /**
-     * 检查卖家数据是否新鲜（存在且 updated_at 在30天内）
+     * 检查卖家数据是否新鲜（存在且 updated_at 在 freshTTL 内）
      * @param {string|number} userId
      * @returns {{ fresh: boolean, exists: boolean, seller: object|null, ageDays: number }}
      */
     checkSellerFresh(userId) {
         const row = this.db.prepare('SELECT * FROM t_seller WHERE user_id = ?').get(parseInt(userId) || 0);
         if (!row) return { fresh: false, exists: false, seller: null, ageDays: Infinity };
+        // updated_at=0 表示仅有精简信息（来自saveProduct），从未被saveSeller完整爬取
+        if (!row.updated_at) return { fresh: false, exists: true, seller: row, ageDays: -1 };
         const now = Math.floor(Date.now() / 1000);
-        const ageSec = now - (row.updated_at || 0);
+        const ageSec = now - row.updated_at;
         const ageDays = Math.floor(ageSec / 86400);
-        const fresh = ageSec <= XianyuDB.FRESH_TTL;
+        const fresh = ageSec <= this.freshTTL;
         return { fresh, exists: true, seller: row, ageDays };
     }
 
@@ -214,50 +244,65 @@ class XianyuDB {
      */
     saveProduct(product) {
         const itemId = product.itemId;
+
+        // 卖家ID缺失时跳过入库，等下次运行重新爬取
+        const sellerId = product.seller?.id || product.sellerId;
+        if (!sellerId) {
+            console.log(`[DB] 商品 ${itemId} 卖家ID缺失，跳过入库（等下次重试）`);
+            return { saved: false, reason: 'no_seller' };
+        }
+
         const freshCheck = this.checkProductFresh(itemId);
         if (freshCheck.fresh) {
             console.log(`[DB] 商品 ${itemId} 数据新鲜（${freshCheck.ageDays}天前更新），跳过写入`);
             return { saved: false, reason: 'fresh' };
         }
         if (freshCheck.exists) {
-            console.log(`[DB] 商品 ${itemId} 数据过期（${freshCheck.ageDays}天前更新），覆盖写入`);
+            const ageLabel = freshCheck.ageDays === -1 ? '从未完整爬取' : `${freshCheck.ageDays}天前更新`;
+            console.log(`[DB] 商品 ${itemId} 数据过期（${ageLabel}），覆盖写入`);
         }
 
         const now = Math.floor(Date.now() / 1000);
-        // 先保存卖家（精简版，来自 sellerDO）
-        if (product.seller?.id) {
-            this._upsertSeller({
-                user_id: product.seller.id,
-                name: product.seller.name || '',
-                avatar: product.seller.avatar || '',
-                city: product.seller.city || '',
-                signature: product.seller.signature || '',
-                has_sold_num: product.seller.hasSoldNum || 0,
-                item_count: product.seller.itemCount || 0,
-                good_ratio: product.seller.goodRatio || '',
-                credit_level: product.seller.creditLevel || '',
-            });
-        }
+        // 先保存卖家（精简版，来自 sellerDO）—— 不刷新 updated_at，避免干扰 saveSeller 的新鲜度检查
+        this._upsertSellerBasic({
+            user_id: sellerId,
+            name: product.seller.name || '',
+            avatar: product.seller.avatar || '',
+            city: product.seller.city || '',
+            signature: product.seller.signature || '',
+            has_sold_num: product.seller.hasSoldNum || 0,
+            item_count: product.seller.itemCount || 0,
+            good_ratio: product.seller.goodRatio || '',
+            credit_level: product.seller.creditLevel || '',
+        });
 
         // 保存商品
         this.db.prepare(`
             INSERT INTO t_product (item_id, seller_id, title, price, original_price, description,
                 sold_cnt, browse_cnt, quantity, collect_cnt, want_cnt, created_time,
-                transport_fee, category_id, item_status, screenshot_url, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                transport_fee, category_id, item_status, screenshot_url,
+                location, area, condition_name, tag_list, keyword, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(item_id) DO UPDATE SET
                 title=excluded.title, price=excluded.price, description=excluded.description,
                 sold_cnt=excluded.sold_cnt, browse_cnt=excluded.browse_cnt, quantity=excluded.quantity,
                 collect_cnt=excluded.collect_cnt, want_cnt=excluded.want_cnt,
                 item_status=excluded.item_status, screenshot_url=excluded.screenshot_url,
+                location=excluded.location, area=excluded.area,
+                condition_name=excluded.condition_name, tag_list=excluded.tag_list,
+                keyword=CASE WHEN excluded.keyword != '' THEN excluded.keyword ELSE t_product.keyword END,
                 updated_at=excluded.updated_at
         `).run(
-            product.itemId, product.seller?.id || 0, product.title, product.price,
-            product.originalPrice, product.description,
+            product.itemId, sellerId, product.title || '', product.price || '',
+            product.originalPrice || '', product.description || '',
             product.soldCnt || 0, product.browseCnt || 0, product.quantity || 0,
             product.collectCnt || 0, product.wantCnt || 0, product.createdTime || 0,
-            product.transportFee, product.categoryId || 0, product.itemStatus,
-            product.screenshotUrl, now
+            product.transportFee || '', product.categoryId || 0, product.itemStatus || '',
+            product.screenshotUrl || '',
+            product.location || '', product.area || '',
+            product.conditionName || '', product.tagList || '',
+            product.keyword || '',
+            now
         );
 
         // 保存图片（来自 uploadedImages）
@@ -292,7 +337,8 @@ class XianyuDB {
             return { saved: false, reason: 'fresh' };
         }
         if (freshCheck.exists) {
-            console.log(`[DB] 卖家 ${userId} 数据过期（${freshCheck.ageDays}天前更新），覆盖写入`);
+            const ageLabel = freshCheck.ageDays === -1 ? '从未完整爬取' : `${freshCheck.ageDays}天前更新`;
+            console.log(`[DB] 卖家 ${userId} 数据过期（${ageLabel}），覆盖写入`);
         }
 
         const now = Math.floor(Date.now() / 1000);
@@ -322,28 +368,30 @@ class XianyuDB {
         });
 
         // 保存卖家在售商品列表
+        console.log(`[DB] saveSeller userId=${userId} items=${seller.items?.length || 0} ratings=${seller.ratings?.length || 0}`);
         if (seller.items?.length) {
             // 清除旧数据再写入
-            this.db.prepare('DELETE FROM t_seller_item WHERE seller_id = ?').run(seller.userId);
+            this.db.prepare('DELETE FROM t_seller_item WHERE seller_id = ?').run(userId);
             const stmt = this.db.prepare(`
-                INSERT OR IGNORE INTO t_seller_item (seller_id, item_id, title, price, image_url, want_cnt)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT OR IGNORE INTO t_seller_item (seller_id, item_id, title, price, image_url, want_cnt, sold_cnt, is_sold, area, category_id, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             `);
             for (const item of seller.items) {
-                stmt.run(seller.userId, item.itemId, item.title, item.price, item.imageUrl, item.wantCnt || 0);
+                stmt.run(userId, item.itemId, item.title, item.price, item.imageUrl, item.wantCnt || 0,
+                    item.soldCnt || 0, item.isSold || 0, item.area || '', item.categoryId || 0, item.status || '');
             }
         }
 
         // 保存评价列表
         if (seller.ratings?.length) {
-            this.db.prepare('DELETE FROM t_seller_rating WHERE seller_id = ?').run(seller.userId);
+            this.db.prepare('DELETE FROM t_seller_rating WHERE seller_id = ?').run(userId);
             const stmt = this.db.prepare(`
-                INSERT INTO t_seller_rating (seller_id, content, rate_time, rater_nick, rater_avatar, rate, tags, custom_words, ip_location)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO t_seller_rating (seller_id, content, rate_time, rater_nick, rater_avatar, rate, tags, custom_words, ip_location, seller_reply, images, is_anonymous)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             `);
             for (const r of seller.ratings) {
                 stmt.run(
-                    seller.userId,
+                    userId,
                     r.content || '',
                     r.rateTime || '',
                     r.raterNick || '',
@@ -351,7 +399,10 @@ class XianyuDB {
                     r.rate || 0,
                     (r.tags || []).join(','),
                     (r.customWords || []).join(','),
-                    r.ipLocation || ''
+                    r.ipLocation || '',
+                    r.sellerReply || '',
+                    r.images || '',
+                    r.isAnonymous || 0
                 );
             }
         }
@@ -373,6 +424,37 @@ class XianyuDB {
             first.itemId || 0,
             first.title || '',
             first.price || ''
+        );
+    }
+
+    /**
+     * 卖家精简写入（仅用于 saveProduct 里的预墙充）
+     * 与 _upsertSeller 的区别：ON CONFLICT 时不更新 updated_at，
+     * 避免在卖家详情页还未爬取时刷新时间戳导致新鲜度误判。
+     */
+    _upsertSellerBasic(s) {
+        const now = Math.floor(Date.now() / 1000);
+        const userId = parseInt(s.user_id) || 0;
+        // updated_at 新建时置 0（未完整爬取），冲突时不更新 updated_at
+        // 只有 saveSeller 完整写入后才会把 updated_at 设为真实时间
+        this.db.prepare(`
+            INSERT INTO t_seller (user_id, name, avatar, city, signature,
+                has_sold_num, item_count, good_ratio, credit_level,
+                created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+            ON CONFLICT(user_id) DO UPDATE SET
+                name = COALESCE(NULLIF(excluded.name, ''), t_seller.name),
+                city = COALESCE(NULLIF(excluded.city, ''), t_seller.city),
+                has_sold_num = CASE WHEN excluded.has_sold_num > 0 THEN excluded.has_sold_num ELSE t_seller.has_sold_num END,
+                item_count = CASE WHEN excluded.item_count > 0 THEN excluded.item_count ELSE t_seller.item_count END,
+                good_ratio = COALESCE(NULLIF(excluded.good_ratio, ''), t_seller.good_ratio),
+                credit_level = COALESCE(NULLIF(excluded.credit_level, ''), t_seller.credit_level)
+        `).run(
+            userId, s.name || '', this._extractString(s.avatar), this._extractString(s.city),
+            this._extractString(s.signature),
+            parseInt(s.has_sold_num) || 0, parseInt(s.item_count) || 0,
+            String(this._extractString(s.good_ratio) || ''), String(this._extractString(s.credit_level) || ''),
+            now
         );
     }
 
@@ -526,13 +608,13 @@ class XianyuDB {
             info.price,
             (info.description || '').slice(0, 500),
             JSON.stringify(info.images || []),
-            ai.is_recommend ? 1 : 0,
+            ai.is_recommended ? 1 : 0,
             (ai.reason || '').slice(0, 500),
-            JSON.stringify(ai.risk_tags || ai.risks || []),
+            JSON.stringify(ai.risk_tags || []),
             JSON.stringify(criteriaAnalysis),
-            ai.bargain_score || 0,
-            ai.is_persion ? 1 : 0,
-            ai.credit || 0,
+            (ai.bargain_score ? parseInt(ai.bargain_score) : 0),
+            (ai.criteria_analysis?.seller_type?.persona?.includes('个人') ? 1 : 0),
+            String(ai.criteria_analysis?.seller_credit?.status || ''),
             ai.raw ? JSON.stringify(ai.raw).slice(0, 5000) : ''
         );
     }
@@ -559,6 +641,41 @@ class XianyuDB {
         return seller;
     }
 
+    /**
+     * 查询需要分析的商品：
+     *   1. 从未分析过（t_analysis 无记录）
+     *   2. 商品有更新（t_product.updated_at > 最新的 t_analysis.created_at）即重新入库
+     * @param {object} [options]
+     * @param {string} [options.keyword] - 按标题过滤
+     * @param {number} [options.limit=100] - 最大返回条数
+     * @returns {Array<{item_id: number, seller_id: number, title: string, price: string, description: string}>}
+     */
+    getUnanalyzedProducts(options = {}) {
+        const { keyword, limit = 100 } = options;
+
+        // 返回：未分析过 OR 商品更新时间新于最新分析时间（重新入库）
+        // keyword 匹配：优先按 t_product.keyword 精确匹配，其次按 title LIKE 模糊匹配
+        let sql = `
+            SELECT p.item_id, p.seller_id, p.title, p.price, p.description, p.keyword, p.updated_at,
+                   MAX(a.created_at) AS last_analyzed_at
+            FROM t_product p
+            LEFT JOIN t_analysis a ON a.item_id = p.item_id
+        `;
+        const params = [];
+        if (keyword) {
+            sql += " WHERE p.keyword = ? OR (p.keyword = '' AND p.title LIKE ?)";
+            params.push(keyword, '%' + keyword + '%');
+        }
+        sql += `
+            GROUP BY p.item_id
+            HAVING last_analyzed_at IS NULL OR p.updated_at > last_analyzed_at
+            ORDER BY p.updated_at DESC
+            LIMIT ?
+        `;
+        params.push(limit);
+        return this.db.prepare(sql).all(...params);
+    }
+
     /** 查询搜索历史 */
     getSearchLogs(keyword, limit = 20) {
         if (keyword) {
@@ -579,6 +696,31 @@ class XianyuDB {
             searchLogs: count('t_search_log'),
             analysis: count('t_analysis'),
         };
+    }
+
+    /**
+     * 重置卖家缓存：清空 t_seller_item / t_seller_rating 并将 t_seller.updated_at 置 0
+     * 下次运行时将强制重新爬取卖家详情
+     * @param {string|number} [userId] - 指定卖家 userId，不传则重置所有
+     */
+    resetSellerCache(userId) {
+        this.db.exec('PRAGMA foreign_keys=OFF');
+        try {
+            if (userId) {
+                const id = parseInt(userId) || 0;
+                this.db.prepare('DELETE FROM t_seller_item WHERE seller_id = ?').run(id);
+                this.db.prepare('DELETE FROM t_seller_rating WHERE seller_id = ?').run(id);
+                this.db.prepare('UPDATE t_seller SET updated_at = 0 WHERE user_id = ?').run(id);
+                console.log(`[DB] 卖家 ${id} 缓存已重置`);
+            } else {
+                this.db.exec('DELETE FROM t_seller_item');
+                this.db.exec('DELETE FROM t_seller_rating');
+                this.db.exec('UPDATE t_seller SET updated_at = 0');
+                console.log('[DB] 所有卖家缓存已重置');
+            }
+        } finally {
+            this.db.exec('PRAGMA foreign_keys=ON');
+        }
     }
 }
 

@@ -13,8 +13,11 @@ module.exports = {
     // 浏览器视口
     viewport: { width: 1366, height: 768 },
 
-    // User-Agent
-    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+    // User-Agent（不设置 → 使用 patchright Chromium 原生 UA）
+    // 原因：自定义 UA 版本号与实际 Chromium 内核不匹配会被闲鱼检测拦截
+    // HeadlessChrome 标识在 BaseScraper.init + anti-detect.js 中自动替换为 Chrome
+    // 如需自定义，确保版本号与 Chromium 内核匹配（当前: 147.x）
+    userAgent: '',
 
     // 地区设置
     locale: 'zh-CN',
@@ -31,22 +34,17 @@ module.exports = {
     loginTimeout: 60000,
 
     // AI 分析相关
-    intelligent: true,                // 启用深度思考
+    intelligent: false,                // 启用深度思考
     prompt: [],                       // 提示词文件路径列表
 
     // 附加输入信息（传给 AI 的补充上下文）
     inputinfo: '',
 
-    // 重复筛查间隔(天)
-    againDay: 2,
+    // 数据新鲜度阈値（天）—— 商品/卖家在此期限内已采集则跳过重新爬取
+    freshTTLDays: 7,
 
-    // 非捡漏商品忽略间隔(天)
-    bargainDay: 7,
-
-    // 搜索最大翻页数
-    maxPages: 10,
-
-    // 手机端域名（用于生成跳转链接）
+    // 搜索最大翻页数（0 = 翻到最后一页为止）
+    maxPages: 0,
     phtoneDomain: 'https://h5.m.goofish.com',
 
     // 钉钉通知地址

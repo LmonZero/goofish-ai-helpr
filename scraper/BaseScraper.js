@@ -51,9 +51,22 @@ class BaseScraper {
      */
     async init() {
         const opts = this.options;
+
+        // 修正 User-Agent：确保 HTTP 头和 JS 层都不暴露 HeadlessChrome
+        //   1. HTTP 请求头：launchPersistentContext 的 userAgent 参数
+        //   2. JS 层 navigator.userAgent：anti-detect.js 中处理
+        // 如果未自定义 UA → 使用 Chromium 原生 UA 但把 HeadlessChrome 替换为 Chrome
+        let ua = opts.userAgent;
+        if (!ua) {
+            // 不设自定义 UA → 先用原生启动，但 Chromium 默认 UA 含 HeadlessChrome
+            // 直接将 HeadlessChrome 替换为 Chrome 作为 userAgent 参数
+            // 格式固定：Mozilla/5.0 (...) HeadlessChrome/XXX Safari/537.36
+            ua = undefined;  // 先不设，下面获取后再设
+        }
+
         this.context = await chromium.launchPersistentContext(this.userDataDir, {
             headless: opts.headless,
-            userAgent: opts.userAgent,
+            userAgent: ua,
             viewport: opts.viewport,
             locale: opts.locale,
             timezoneId: opts.timezoneId,
@@ -62,6 +75,24 @@ class BaseScraper {
             colorScheme: 'light',
             extraHTTPHeaders: { 'accept-language': 'zh-CN,zh;q=0.9' },
         });
+
+        // 如果未自定义 UA，获取 Chromium 原生 UA 并修正 HeadlessChrome
+        if (!opts.userAgent) {
+            const testPage = await this.context.newPage();
+            const realUA = await testPage.evaluate(() => navigator.userAgent);
+            await testPage.close();
+            const fixedUA = realUA.replace('HeadlessChrome/', 'Chrome/');
+            // 对上下文中所有现有页面设置 UA override
+            for (const page of this.context.pages()) {
+                try {
+                    const cdpSession = await this.context.newCDPSession(page);
+                    await cdpSession.send('Network.setUserAgentOverride', {
+                        userAgent: fixedUA,
+                    });
+                } catch { /* 某些页面可能无法创建 CDP session */ }
+            }
+            console.log(`[BaseScraper] UA 已修正: ${fixedUA}`);
+        }
 
         // 上下文级别注入反检测脚本 → 所有页面自动生效
         await this.context.addInitScript(antiDetectScript);

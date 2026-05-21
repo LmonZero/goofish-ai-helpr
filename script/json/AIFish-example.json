@@ -1,6 +1,7 @@
 {
 	"keyword": "MacBook Air M1",
 	"intelligent": true,
+	"aiPlatform": "zhipu",
 	"promptBase": "./prompt/base_prompt.txt",
 	"promptCriteria": "./prompt/macbook_criteria.txt",
 	"againDay": 2,

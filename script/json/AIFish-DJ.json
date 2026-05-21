@@ -1,11 +1,12 @@
 {
 	"keyword": "DJI Osmo Action 4",
-	"intelligent": true,
+	"aiPlatform": "zhipu",
+	"intelligent": false,
 	"promptBase": "./prompt/base_prompt.txt",
-	"promptCriteria": "./prompt/dji_criteria.txt",
+	"promptCriteria": "./prompt/dji_osmo_action_4_criteria.txt",
 	"againDay": 2,
 	"bargainDay": 7,
 	"phtoneDomain": "https://h5.m.goofish.com",
 	"dataName": "demo",
-	"ddUrl": "https://oapi.dingtalk.com/robot/send?access_token=11111159f07e0880ad66e5126f61f8dd20744960d91da5067db041fe31fd39e"
+	"ddUrl": "https://oapi.dingtalk.com/robot/send?access_token=7fb99a459f07e0880ad66e5126f61f8dd20744960d91da5067db041fe31fd39e"
 }

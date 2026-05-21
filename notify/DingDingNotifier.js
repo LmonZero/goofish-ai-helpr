@@ -43,33 +43,71 @@ class DingDingNotifier {
      * @param {string} keyword - 搜索关键词
      */
     async notifyFishBargain(url, info, phoneDomain, keyword) {
-        let msg = `【闲鱼捡漏】-${keyword}\n`
-            + `- [手机跳转](${phoneDomain}${new URL(info.addr).pathname + new URL(info.addr).search})\n`
-            + `- 标题：${info.description.slice(0, 100)}...\n`
-            + `- 识别结果：${info.aiReply.identified_brand_model}\n`
-            + `- 价格：${info.price}\n`
-            + `- 是否个人卖家：${info.aiReply.is_persion ? '是' : '否'}\n`
-            + `- 信用等级：${info.aiReply.credit}\n`
-            + `- 评估：${info.aiReply.bargain_level}\n`
-            + `- 评分：${info.aiReply.bargain_score}\n`
-            + `- 评估理由：${info.aiReply.key_findings}\n`
-            + `- 风险提示：\n${info.aiReply.risks.join('\n')}\n`
-            + `- 推荐意见：${info.aiReply.recommendation}\n`
-            + `- 链接：<${info.addr}>\n`
-            + `- 产品id：${info.productId}\n`;
+        const reply = info.aiReply || {};
+        const analysis = reply.criteria_analysis || {};
 
-        let imgSrc = '> - 详情图片：\n';
-        for (const pic of info.images) {
-            if (pic.includes('webp')) {
-                imgSrc += '> ' + '<' + pic + '>' + '\n';
-            } else {
-                imgSrc += `> ![screenshot](${pic})\n`;
-            }
+        // 手机端跳转链接
+        let mobileLink = info.addr;
+        try {
+            const u = new URL(info.addr);
+            mobileLink = phoneDomain + u.pathname + u.search;
+        } catch (_) { /* 非标准 URL 则保持原样 */ }
+
+        let msg = `## 🎯 ${keyword} — 推荐商品\n\n`
+            + `**[📱 手机查看](${mobileLink})**　　[💻 PC查看](${info.addr})\n\n`
+            + `---\n\n`
+            + `### 📦 商品信息\n\n`
+            + `- **标题：** ${(info.description || '').slice(0, 100)}\n`
+            + `- **价格：** ${info.price || '未知'}\n\n`
+            + `---\n\n`
+            + `### 🧠 AI 分析结论\n\n`
+            + `> ${reply.reason || '暂无评价'}\n\n`;
+
+        // 各维度分析
+        const dims = [
+            { key: 'model_chip', label: '型号/芯片' },
+            { key: 'battery_health', label: '电池健康' },
+            { key: 'condition', label: '成色状态' },
+            { key: 'history', label: '使用历史' },
+            { key: 'shipping', label: '发货/售后' },
+            { key: 'seller_credit', label: '卖家信用' },
+        ];
+        for (const dim of dims) {
+            const d = analysis[dim.key];
+            if (!d) continue;
+            msg += `- **${dim.label}**：${d.status || ''}`;
+            if (d.comment) msg += ` — ${d.comment}`;
+            if (d.evidence) msg += `（${d.evidence}）`;
+            msg += '\n';
         }
-        msg += imgSrc;
 
-        if (info.aiReply.is_bargain) {
-            await this.postMarkdown(url, '闲鱼捡漏', msg);
+        // 卖家画像
+        const st = analysis.seller_type;
+        if (st) {
+            msg += '\n**卖家画像**：';
+            if (st.persona) msg += `${st.persona}`;
+            if (st.comment) msg += ` — ${st.comment}`;
+            msg += '\n';
+        }
+
+        // 风险标签
+        if (reply.risk_tags?.length) {
+            msg += `\n**⚠️ 风险标签**：${reply.risk_tags.join('、')}\n`;
+        }
+
+        msg += '\n---\n\n';
+
+        // 商品图片（全部来自图床，可直接内嵌展示）
+        if (info.images?.length) {
+            msg += `### 📷 商品图片\n\n`;
+            for (const pic of info.images.slice(0, 6)) {
+                msg += `![商品图](${pic})\n`;
+            }
+            msg += '\n';
+        }
+
+        if (reply.is_recommended) {
+            await this.postMarkdown(url, `闲鱼【${keyword}】推荐商品`, msg);
         }
     }
 
@@ -113,4 +151,4 @@ class DingDingNotifier {
     }
 }
 
-module.exports = new DingDingNotifier();
+module.exports = DingDingNotifier;

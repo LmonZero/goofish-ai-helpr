@@ -60,7 +60,7 @@ class GoofishScraper extends BaseScraper {
         /** 卖家评价列表 — 分页，data 含 cardList + nextPage */
         sellerRatings: /mtop\.idle\.web\.trade\.rate\.list/i,
         /** 商品评价（详情页） */
-        reviewList: /mtop\.idle\.web\.trade\.rate/i,
+        reviewList: /mtop\.idle\.web\.trade\.rate(?!\.list)/i,
     };
 
     /**
@@ -85,12 +85,16 @@ class GoofishScraper extends BaseScraper {
         adCloseBtn: 'div[class*="closeIconBg"]',
 
         // ======================== 分页相关 ========================
-        /** 页码信息文本（如 "1/10"） */
-        pageInfo: 'div[class*="search-page-tiny"] span',
+        /** 页码信息文本（如 "1/50"） */
+        pageInfo: 'span[class*="search-page-tiny-page"]',
         /** 分页按钮容器 */
-        paginationContainer: 'div[class*="search-footer-page"], div[class*="pagination"]',
-        /** 下一页按钮 */
-        nextPageBtn: 'button[class*="next"]:not([disabled])',
+        paginationContainer: 'div[class*="search-page-tiny-container"]',
+        /** 下一页按钮（右箭头） */
+        nextPageBtn: 'div[class*="search-page-tiny-container"] button:last-child:not([disabled])',
+
+        // ======================== 卖家页面相关 ========================
+        /** "信用及评价" tab */
+        sellerRatingTab: 'text=信用及评价',
 
         // ======================== 反爬虫弹窗选择器 ========================
         /** 八匣反爬虫验证弹窗 */
@@ -99,8 +103,8 @@ class GoofishScraper extends BaseScraper {
         middlewareWidget: 'div.J_MIDDLEWARE_FRAME_WIDGET',
 
         // ======================== 登录相关（iframe 内扫码登录）========================
-        /** 首页"立即登录"按钮（未登录时显示的弹窗按钮，点击后触发 QR 码 iframe） */
-        loginPromptBtn: 'text=立即登录',
+        /** 首页"登录"按钮（未登录时 header 右上角显示，文本为"登录"） */
+        loginPromptBtn: 'div[class*="user-order-container"] div[class*="nick"]',
         /** 首页"登录后可以更懂你"文字（未登录时弹出的提示文案） */
         loginPromptText: 'text=登录后可以更懂你',
         /** 登录 iframe 选择器（多种入口，逗号分隔，waitForSelector 支持 CSS 逗号） */
@@ -109,6 +113,8 @@ class GoofishScraper extends BaseScraper {
         qrCodeSuccess: '.qrcode-success',
         /** iframe 内："保持登录"确认按钮 */
         keepLoginBtn: 'button.keep-login-confirm-btn',
+        /** 已登录标志：nick 文本不为"登录"即为已登录 */
+        loggedInIndicator: 'div[class*="user-order-container"] div[class*="nick"]',
     };
 
     /** 闲鱼 PC 站首页 */
@@ -201,13 +207,14 @@ class GoofishScraper extends BaseScraper {
      * @param {boolean} [filters.personal] - 是否筛选“个人闲置”
      * @param {boolean} [filters.freeShipping] - 是否筛选“包邮”
      * @param {object} [options] - 其他选项
-     * @param {number} [options.maxPages=10] - 最大翻页数
+     * @param {number} [options.maxPages=0] - 最大翻页数，0=翻到最后一页
      * @returns {Promise<Array>} 商品列表
      */
     async search(keyword, filters = {}, options = {}) {
         const page = this._page;
         const selectors = this.constructor.TRIGGER_SELECTORS;
-        const { maxPages = 10 } = options;
+        const { maxPages = 0 } = options;
+        const unlimited = maxPages <= 0;
 
         // 清空上次缓存
         this.clearApiCache();
@@ -221,6 +228,13 @@ class GoofishScraper extends BaseScraper {
         // 先注册一次性响应监听，避免错过首次请求
         // 匹配闲鱼 mtop 搜索 API（只排除 shade/activate 辅助接口）
         const apiPatterns = this.constructor.API_PATTERNS;
+        const mtopRequests = [];  // 记录所有 mtop 请求，便于调试
+        page.on('request', req => {
+            const url = req.url();
+            if (url.includes('mtop.')) {
+                mtopRequests.push(url.split('?')[0]);
+            }
+        });
         const makeSearchResponsePromise = () => page.waitForResponse(
             res => {
                 const url = res.url();
@@ -238,7 +252,8 @@ class GoofishScraper extends BaseScraper {
         await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
         console.log(`[GoofishScraper] 已导航到搜索页: ${searchUrl}`);
 
-        // 2. 搜索页可能需要登录（iframe 或"立即登录"按钮）
+        // 2. 搜索页登录状态检查
+        //    用 nick 文本判断（和首页一样），而不是检查元素是否可见
         let needRelogin = false;
         const loginFrame = await this._detectLoginIframe(3000);
         if (loginFrame) {
@@ -246,17 +261,33 @@ class GoofishScraper extends BaseScraper {
             await this._handleQRCodeLogin(this.options.loginTimeout || 120000);
             needRelogin = true;
         } else {
-            // 也检查"立即登录"按钮
-            const loginPrompt = await page.$(selectors.loginPromptBtn).catch(() => null);
-            if (loginPrompt && await loginPrompt.isVisible().catch(() => false)) {
-                console.log('[GoofishScraper] 搜索页检测到"立即登录"按钮，点击触发登录...');
-                await loginPrompt.click().catch(() => { });
+            // 用 page.evaluate 检查 nick 文本
+            const searchNick = await page.evaluate(() => {
+                const nick = document.querySelector('div[class*="nick"]');
+                if (nick) return nick.textContent?.trim() || '';
+                const container = document.querySelector('div[class*="user-order-container"]');
+                if (container) {
+                    const divs = container.querySelectorAll('div, span');
+                    for (const d of divs) {
+                        const t = d.textContent?.trim();
+                        if (t && t.length < 20 && d.children.length === 0) return t;
+                    }
+                }
+                return '';
+            }).catch(() => '');
+            if (searchNick === '登录') {
+                console.log('[GoofishScraper] 搜索页检测到未登录（nick="登录"），开始登录流程...');
+                // 点击"登录"触发 QR 码 iframe
+                const loginBtn = await page.$(selectors.loginPromptBtn).catch(() => null);
+                if (loginBtn) await loginBtn.click().catch(() => { });
                 await this._sleep(2000);
                 const frame2 = await this._detectLoginIframe(8000);
                 if (frame2) {
                     await this._handleQRCodeLogin(this.options.loginTimeout || 120000);
                     needRelogin = true;
                 }
+            } else if (searchNick) {
+                console.log(`[GoofishScraper] 搜索页已登录（nick="${searchNick}"）`);
             }
         }
         if (needRelogin) {
@@ -265,11 +296,13 @@ class GoofishScraper extends BaseScraper {
             await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
         }
 
-        // 3. 等待“新发布”元素出现（确认搜索页已加载）
+        // 3. 等待"新发布"元素出现（确认搜索页已加载）
         try {
             await page.locator(selectors.filterNewPublish).first().waitFor({ state: 'visible', timeout: 15000 });
         } catch {
             console.log('[GoofishScraper] "新发布"元素未出现，可能未登录或页面异常');
+            // 等待网络空闲，给 API 请求更多时间
+            await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => { });
         }
 
         // 4. 检查反爬虫弹窗
@@ -289,7 +322,12 @@ class GoofishScraper extends BaseScraper {
                 console.log('[GoofishScraper] 初始搜索响应 JSON 解析失败');
             }
         } else {
-            console.log('[GoofishScraper] 未捕获到 JSON 搜索响应（页面可能为 SSR 渲染）');
+            console.log('[GoofishScraper] 未捕获到 JSON 搜索响应');
+            if (mtopRequests.length > 0) {
+                console.log('[GoofishScraper] 页面 mtop 请求:', [...new Set(mtopRequests)].join(', '));
+            } else {
+                console.log('[GoofishScraper] 页面无任何 mtop 请求（可能未登录或被反爬拦截）');
+            }
         }
 
         // 7. 应用筛选条件
@@ -318,16 +356,19 @@ class GoofishScraper extends BaseScraper {
             }
         }
 
-        // 9. 翻页加载更多
+        // 9. 翻页加载更多（maxPages>0 按配置限制，否则翻到最后一页）
         let currentPage = 1;
-        while (currentPage < maxPages) {
+        // 先读取总页数（如 "1/50" 中的 50）
+        const totalPages = await this._getTotalPages();
+        const totalPagesLabel = totalPages > 0 ? `/${totalPages}` : '';
+        while (unlimited || currentPage < maxPages) {
             const hasNext = await this._hasNextPage();
             if (!hasNext) {
-                console.log(`[GoofishScraper] 第 ${currentPage} 页已是最后一页`);
+                console.log(`[GoofishScraper] 第 ${currentPage}${totalPagesLabel} 页已是最后一页，停止翻页`);
                 break;
             }
 
-            console.log(`[GoofishScraper] 正在加载第 ${currentPage + 1} 页...`);
+            console.log(`[GoofishScraper] 正在翻至第 ${currentPage + 1}${totalPagesLabel} 页...`);
 
             // 清空 searchList 缓存，准备接收新的响应
             this._apiResponses.delete('searchList');
@@ -344,26 +385,31 @@ class GoofishScraper extends BaseScraper {
             if (nextApi && nextApi.body) {
                 const nextResults = this._parseSearchResult(nextApi.body);
                 if (nextResults.length > 0) {
-                    console.log(`[GoofishScraper] 第 ${currentPage + 1} 页加载 ${nextResults.length} 个商品`);
+                    currentPage++;
+                    // 翻页后读取实际页码确认
+                    const actualPage = await this._getCurrentPage();
+                    const pageLabel = actualPage > 0 ? `${actualPage}${totalPagesLabel}` : `${currentPage}${totalPagesLabel}`;
+                    console.log(`[GoofishScraper] 已加载第 ${pageLabel} 页，本页 ${nextResults.length} 个商品，共累计 ${this._searchResults.length + nextResults.length} 个`);
                     this._searchResults.push(...nextResults);
                 } else {
-                    console.log(`[GoofishScraper] 第 ${currentPage + 1} 页解析结果为空，停止翻页`);
+                    console.log(`[GoofishScraper] 第 ${currentPage + 1}${totalPagesLabel} 页解析结果为空，停止翻页`);
                     break;
                 }
             } else {
-                // API 未捕获，尝试 DOM 兜底（当前页）
+                // API 未捕获，尝试 DOM 底底（当前页）
                 await this._sleep(2000);
                 const domResults = await this._parseSearchResultFromDOM();
                 if (domResults.length > 0) {
-                    console.log(`[GoofishScraper] 第 ${currentPage + 1} 页 DOM 兜底 ${domResults.length} 个商品`);
+                    currentPage++;
+                    const actualPage = await this._getCurrentPage();
+                    const pageLabel = actualPage > 0 ? `${actualPage}${totalPagesLabel}` : `${currentPage}${totalPagesLabel}`;
+                    console.log(`[GoofishScraper] 第 ${pageLabel} 页 DOM 底底 ${domResults.length} 个商品，共累计 ${this._searchResults.length + domResults.length} 个`);
                     this._searchResults.push(...domResults);
                 } else {
-                    console.log(`[GoofishScraper] 第 ${currentPage + 1} 页未获取到数据，停止翻页`);
+                    console.log(`[GoofishScraper] 第 ${currentPage + 1}${totalPagesLabel} 页未获取到数据，停止翻页`);
                     break;
                 }
             }
-
-            currentPage++;
         }
 
         // 10. 全部翻页完成后，如果仍无结果，尝试 DOM 兜底
@@ -383,8 +429,9 @@ class GoofishScraper extends BaseScraper {
      * @returns {Promise<object|null>} 商品详情数据
      */
     async scrapeProduct(itemId) {
-        // DB 新鲜度检查：30天内已采集过的商品直接返回数据库数据，避免重复访问
-        const db = new XianyuDB();
+        // DB 新鲜度检查：已采集且在 freshTTLDays 天内的商品直接返回数据库数据，避免重复访问
+        const freshTTLDays = this.options.freshTTLDays;
+        const db = new XianyuDB(null, freshTTLDays);
         db.open();
         try {
             const freshCheck = db.checkProductFresh(itemId);
@@ -395,7 +442,8 @@ class GoofishScraper extends BaseScraper {
                 return this._dbProductToResult(cachedProduct);
             }
             if (freshCheck.exists) {
-                console.log(`[GoofishScraper] 商品 ${itemId} 数据过期（${freshCheck.ageDays}天前更新），重新爬取`);
+                const ageLabel = freshCheck.ageDays === -1 ? '从未完整爬取' : `${freshCheck.ageDays}天前更新`;
+                console.log(`[GoofishScraper] 商品 ${itemId} 数据过期（${ageLabel}），重新爬取`);
             } else {
                 console.log(`[GoofishScraper] 商品 ${itemId} DB无记录，首次爬取`);
             }
@@ -417,23 +465,18 @@ class GoofishScraper extends BaseScraper {
         // 2. 等待商品详情 API（已包含 itemDO + sellerDO + picDetailDO）
         const detailResult = await this.waitForApiResponse('productDetail', 15000);
 
-        // 3. 滚动加载评价（可选，不影响核心数据）
-        await this._scrollForReviews();
-
-        // 4. 等待评价 API（非阻塞，5s 短超时）
-        const reviewResult = await this.waitForApiResponse('reviewList', 5000);
-
-        // 5. 截取商品详情页截图（先滚回顶部，确保拍到商品图片区域）
+        // 3. 截取商品详情页截图（先滚回顶部，确保拍到商品图片区域）
         await page.evaluate(() => window.scrollTo(0, 0)).catch(() => { });
         await this._sleep(500);
-        const screenshotBuffer = await page.screenshot({ fullPage: true }).catch(() => null);
+        // 使用 jpeg 格式 + 60% 质量压缩，避免 PNG 全页截图超过图床 413 限制
+        const screenshotBuffer = await page.screenshot({ fullPage: true, type: 'jpeg', quality: 60 }).catch(() => null);
 
         // 6. 上传截图到图床
         let screenshotUrl = '';
         if (screenshotBuffer) {
             try {
                 screenshotUrl = await imageHosting.upload(screenshotBuffer, 'url', {
-                    filename: `goofish_${itemId}.png`,
+                    filename: `goofish_${itemId}.jpg`,
                 });
                 console.log(`[GoofishScraper] 截图已上传: ${screenshotUrl}`);
             } catch (e) {
@@ -487,14 +530,12 @@ class GoofishScraper extends BaseScraper {
         // sellerDO 已包含在 detailData 中，不需要单独的 sellerInfo API
         this._logStep('详情API', '获取商品详情数据', {
             hasDetail: !!detailResult,
-            hasReview: !!reviewResult,
             detailKeys: detailResult?.body?.data ? Object.keys(detailResult.body.data) : [],
         }, !!detailResult);
 
         const product = this._assembleProductDetail({
             itemId,
             detailData: detailResult?.body?.data,
-            reviewData: reviewResult?.body?.data,
             screenshotUrl,
         });
 
@@ -524,8 +565,9 @@ class GoofishScraper extends BaseScraper {
     async scrapeSeller(userId, options = {}) {
         const { withItems = true, withRatings = true, withScreenshot = true } = options;
 
-        // DB 新鲜度检查：30天内已采集过的卖家直接返回数据库数据，避免重复访问
-        const db = new XianyuDB();
+        // DB 新鲜度检查：已采集且在 freshTTLDays 天内的卖家直接返回数据库数据，避免重复访问
+        const freshTTLDays = this.options.freshTTLDays;
+        const db = new XianyuDB(null, freshTTLDays);
         db.open();
         try {
             const freshCheck = db.checkSellerFresh(userId);
@@ -536,7 +578,8 @@ class GoofishScraper extends BaseScraper {
                 return this._dbSellerToResult(cachedSeller);
             }
             if (freshCheck.exists) {
-                console.log(`[GoofishScraper] 卖家 ${userId} 数据过期（${freshCheck.ageDays}天前更新），重新爬取`);
+                const ageLabel = freshCheck.ageDays === -1 ? '从未完整爬取' : `${freshCheck.ageDays}天前更新`;
+                console.log(`[GoofishScraper] 卖家 ${userId} 数据过期（${ageLabel}），重新爬取`);
             } else {
                 console.log(`[GoofishScraper] 卖家 ${userId} DB无记录，首次爬取`);
             }
@@ -586,13 +629,34 @@ class GoofishScraper extends BaseScraper {
             }, allItemCards.length > 0);
         }
 
-        // ---- 阶段3: 点击“信用及评价” + 滚动加载全部评价 ----
+        // ---- 阶段3: 点击"信用及评价" + 滚动加载全部评价 ----
         let allRatingCards = [];
         if (withRatings) {
             try {
-                const ratingTab = page.locator("//div[text()='信用及评价']/ancestor::li");
-                if (await ratingTab.count() > 0) {
-                    await ratingTab.first().click();
+                // DOM 结构: li > div.item > div.title > div.textReal("信用及评价") + div.textShadow(遮挡层)
+                // 直接点 textReal 会被 textShadow 拦截，必须定位到父级 li 元素再点击
+                let ratingTabEl = null;
+
+                // 策略1: 定位包含该文本的 li 元素（最稳定）
+                const liWithRating = page.locator('li').filter({ hasText: /信用及评价/ });
+                if (await liWithRating.count() > 0) {
+                    ratingTabEl = liWithRating.first();
+                }
+
+                // 策略2: 定位 [class*="item"] 父容器
+                if (!ratingTabEl) {
+                    const itemWithRating = page.locator('[class*="item"]').filter({ hasText: /信用及评价/ });
+                    if (await itemWithRating.count() > 0) ratingTabEl = itemWithRating.first();
+                }
+
+                if (ratingTabEl) {
+                    // 优先常规点击，被遮挡则改用 dispatchEvent 绕过
+                    try {
+                        await ratingTabEl.click({ timeout: 5000 });
+                    } catch {
+                        console.log('[GoofishScraper] 常规点击被遮挡，改用 dispatchEvent 触发');
+                        await ratingTabEl.dispatchEvent('click');
+                    }
                     await this._sleep(3000);
 
                     // 等待第一页评价 API
@@ -621,8 +685,9 @@ class GoofishScraper extends BaseScraper {
                         totalCards: allRatingCards.length, ratingScrollRound,
                     }, allRatingCards.length > 0);
                 } else {
-                    console.log('[GoofishScraper] 未找到“信用及评价”tab，跳过评价采集');
+                    console.log('[GoofishScraper] 未找到"信用及评价"tab，跳过评价采集');
                 }
+
             } catch (e) {
                 console.log(`[GoofishScraper] 评价采集失败: ${e.message}`);
             }
@@ -633,11 +698,12 @@ class GoofishScraper extends BaseScraper {
         if (withScreenshot) {
             await page.evaluate(() => window.scrollTo(0, 0)).catch(() => { });
             await this._sleep(500);
-            const screenshotBuffer = await page.screenshot({ fullPage: true }).catch(() => null);
+            // 使用 jpeg 格式 + 60% 质量压缩，避免 PNG 全页截图超过图床 413 限制
+            const screenshotBuffer = await page.screenshot({ fullPage: true, type: 'jpeg', quality: 60 }).catch(() => null);
             if (screenshotBuffer) {
                 try {
                     screenshotUrl = await imageHosting.upload(screenshotBuffer, 'url', {
-                        filename: `goofish_seller_${userId}.png`,
+                        filename: `goofish_seller_${userId}.jpg`,
                     });
                 } catch (e) {
                     console.log(`[GoofishScraper] 卖家主页截图上传失败: ${e.message}`);
@@ -681,12 +747,18 @@ class GoofishScraper extends BaseScraper {
         // card 结构: { cardData: { auctionType, categoryId, detailParams: { itemId, picUrl, title, price, ... } } }
         const items = (itemCards || []).map(card => {
             const dp = card?.cardData?.detailParams || card?.main || card || {};
+            const cd = card?.cardData || {};
             return {
                 itemId: dp.itemId || dp.id || '',
                 title: dp.title || '',
                 price: dp.price || dp.soldPrice || '',
                 imageUrl: dp.picUrl || dp.picUrlList?.[0] || dp.imageUrl || '',
                 wantCnt: dp.wantCnt || 0,
+                soldCnt: dp.soldCnt || cd.soldCnt || 0,
+                isSold: dp.isSold ? 1 : (dp.status === 'sold' ? 1 : 0),
+                area: dp.area || dp.location || '',
+                categoryId: dp.categoryId || cd.categoryId || 0,
+                status: dp.status || (dp.onShelf !== undefined ? (dp.onShelf ? 'onshelf' : 'offshelf') : ''),
                 url: (dp.itemId || dp.id) ? `https://www.goofish.com/item?id=${dp.itemId || dp.id}` : '',
             };
         }).filter(item => item.itemId);
@@ -704,6 +776,9 @@ class GoofishScraper extends BaseScraper {
                 tags: (cd.rateTagList || []).map(t => t.text || ''),
                 customWords: (cd.idleCustomWordContents || []).map(w => w.content || ''),
                 ipLocation: cd.ipAddress || '',
+                sellerReply: cd.sellerReply || '',
+                images: Array.isArray(cd.images) ? cd.images.join(',') : '',
+                isAnonymous: cd.isAnonymous ? 1 : 0,
             };
         });
 
@@ -762,6 +837,22 @@ class GoofishScraper extends BaseScraper {
             console.log('[GoofishScraper] 页面关键元素已渲染');
         } catch {
             console.log('[GoofishScraper] 关键元素未出现，继续执行登录流程');
+            // 诊断：截图 + 打印页面标题和关键 HTML
+            try {
+                const debugDir = qrUtils.ensureTempDir('goofish');
+                const debugPath = path.join(debugDir, `debug_pageReady_${Date.now()}.png`);
+                await this._page.screenshot({ path: debugPath, fullPage: false });
+                const title = await this._page.title();
+                const url = this._page.url();
+                // 获取 header 区域 HTML
+                const headerHtml = await this._page.evaluate(() => {
+                    const header = document.querySelector('header') || document.querySelector('div[class*="header"]');
+                    return header ? header.innerHTML.slice(0, 2000) : 'NO_HEADER_FOUND';
+                }).catch(() => 'EVAL_FAILED');
+                console.log(`[GoofishScraper] 页面诊断: title="${title}", url=${url}`);
+                console.log(`[GoofishScraper] header HTML: ${headerHtml.slice(0, 500)}`);
+                console.log(`[GoofishScraper] 诊断截图: ${debugPath}`);
+            } catch { }
         }
     }
 
@@ -779,30 +870,65 @@ class GoofishScraper extends BaseScraper {
         const selectors = this.constructor.TRIGGER_SELECTORS;
         const loginTimeout = this.options.loginTimeout || 120000;
 
-        // 1. 检测"立即登录"按钮（首页最可靠的未登录标志）
-        const loginPrompt = await this._page.$(selectors.loginPromptBtn).catch(() => null);
-        if (loginPrompt) {
-            const isVisible = await loginPrompt.isVisible().catch(() => false);
-            if (isVisible) {
-                console.log('[GoofishScraper] 检测到"立即登录"按钮，需要登录');
-                // 点击"立即登录"触发 QR 码 iframe
-                await loginPrompt.click().catch(() => { });
+        // 1. 检测 header 右上角 nick 文本
+        //    未登录: 文本 = "登录"
+        //    已登录: 文本 = 用户昵称（如"张三"）
+        //    使用 page.evaluate 直接查 DOM，避免 CSS hash 变化导致选择器失效
+        let nickText = '';
+        try {
+            // 最多等待 10s，每 1s 检查一次
+            for (let i = 0; i < 10; i++) {
+                nickText = await this._page.evaluate(() => {
+                    // 方式1: 精确匹配 nick class
+                    const nick = document.querySelector('div[class*="nick"]');
+                    if (nick) return nick.textContent?.trim() || '';
+                    // 方式2: 在 user-order-container 内找第一个 div 文本
+                    const container = document.querySelector('div[class*="user-order-container"]');
+                    if (container) {
+                        const divs = container.querySelectorAll('div, span');
+                        for (const d of divs) {
+                            const t = d.textContent?.trim();
+                            if (t && t.length < 20 && d.children.length === 0) return t;
+                        }
+                    }
+                    return '';
+                }).catch(() => '');
+                if (nickText) break;
+                await this._sleep(1000);
+            }
+            console.log(`[GoofishScraper] header nick 文本: "${nickText}"`);
+        } catch {
+            console.log('[GoofishScraper] header nick 元素未出现，等待页面加载...');
+        }
+
+        if (nickText === '登录') {
+            console.log('[GoofishScraper] 检测到"登录"按钮，需要登录');
+            // 点击"登录"触发 QR 码 iframe
+            try {
+                const loginBtn = await this._page.$(selectors.loginPromptBtn).catch(() => null);
+                if (loginBtn) await loginBtn.click().catch(() => { });
                 await this._sleep(2000);
-                // 等待 QR 码 iframe 出现
-                const loginFrame = await this._detectLoginIframe(8000);
-                if (loginFrame) {
-                    console.log('[GoofishScraper] QR 码 iframe 已弹出，开始扫码登录...');
-                    await this._handleQRCodeLogin(loginTimeout);
-                    return;
-                }
-                // iframe 没出现可能弹出了别的登录方式，继续等待
-                console.log('[GoofishScraper] 点击登录后未检测到 iframe，尝试继续等待...');
+            } catch { }
+            // 等待 QR 码 iframe 出现
+            const loginFrame = await this._detectLoginIframe(8000);
+            if (loginFrame) {
+                console.log('[GoofishScraper] QR 码 iframe 已弹出，开始扫码登录...');
                 await this._handleQRCodeLogin(loginTimeout);
                 return;
             }
+            // iframe 没出现可能弹出了别的登录方式，继续等待
+            console.log('[GoofishScraper] 点击登录后未检测到 iframe，尝试继续等待...');
+            await this._handleQRCodeLogin(loginTimeout);
+            return;
         }
 
-        // 2. 无"立即登录" → 检测是否已有 QR 码 iframe（搜索页可能直接弹出）
+        if (nickText && nickText !== '登录') {
+            // nick 文本是用户昵称 → 已登录
+            console.log(`[GoofishScraper] 已登录（用户: ${nickText}），跳过登录流程`);
+            return;
+        }
+
+        // 2. nick 元素未出现或文本为空 → 检测是否已有 QR 码 iframe
         const loginFrame = await this._detectLoginIframe(3000);
         if (loginFrame) {
             console.log('[GoofishScraper] 检测到登录 iframe，开始扫码登录...');
@@ -810,8 +936,14 @@ class GoofishScraper extends BaseScraper {
             return;
         }
 
-        // 3. 无登录提示 + 无 iframe → 已登录
-        console.log('[GoofishScraper] 已登录，跳过登录流程');
+        // 3. 仍然无法确定 → 用 _checkLoginStatus 再次确认
+        const isLoggedIn = await this._checkLoginStatus();
+        if (isLoggedIn) {
+            console.log('[GoofishScraper] 已登录，跳过登录流程');
+        } else {
+            console.log('[GoofishScraper] 未检测到登录标志，需要登录');
+            await this._handleQRCodeLogin(loginTimeout);
+        }
     }
 
     /**
@@ -922,30 +1054,49 @@ class GoofishScraper extends BaseScraper {
                 this._logStep('QR标签切换', '找到扫码标签并点击', { error: e.message }, false);
             }
 
-            // 截图用于 QR 识别
-            // 优先截 iframe 元素（QR码占比大，识别率高），fallback 截全页
-            let iframeHandle = null;
+            // 截图用于 QR 识别 — 从小到大逐级截图，识别成功即停
+            // 级别1: iframe 内部 QR 码 <img> 元素（最精准）
+            // 级别2: iframe 内部 body（QR 码占比大）
+            // 级别3: iframe 外壳元素
+            // 级别4: 全页截图（兜底）
+            let qrResult = { success: false };
             try {
                 const iframeElements = await page.$$('iframe').catch(() => []);
                 for (const iframe of iframeElements) {
                     const id = await iframe.getAttribute('id').catch(() => '');
-                    if (id === 'alibaba-login-box') {
-                        iframeHandle = iframe;
-                        break;
+                    if (id !== 'alibaba-login-box') continue;
+                    const frame = await iframe.contentFrame().catch(() => null);
+
+                    // 级别1: 截 QR 码 <img> 元素
+                    if (frame) {
+                        const qrImg = await frame.$('img[src*="qrcode"], img[src*="qr"], img[alt*="二维码"], .qrcode-img img, .qrcode img').catch(() => null);
+                        if (qrImg) {
+                            await qrImg.screenshot({ path: screenshotPath }).catch(() => { });
+                            qrResult = await qrUtils.decodeAndPrintQR(screenshotPath, { silent: true });
+                            if (qrResult.success) break;
+                        }
+
+                        // 级别2: 截 iframe 内部 body
+                        const body = await frame.$('body').catch(() => null);
+                        if (body) {
+                            await body.screenshot({ path: screenshotPath }).catch(() => { });
+                            qrResult = await qrUtils.decodeAndPrintQR(screenshotPath, { silent: true });
+                            if (qrResult.success) break;
+                        }
                     }
+
+                    // 级别3: 截 iframe 外壳元素
+                    await iframe.screenshot({ path: screenshotPath }).catch(() => { });
+                    qrResult = await qrUtils.decodeAndPrintQR(screenshotPath, { silent: true });
+                    if (qrResult.success) break;
                 }
             } catch { }
 
-            if (iframeHandle) {
-                await iframeHandle.screenshot({ path: screenshotPath }).catch(async () => {
-                    // iframe截图失败（可能跨域），fallback截全页
-                    await page.screenshot({ path: screenshotPath, fullPage: false });
-                });
-            } else {
+            // 级别4: 全页截图兜底
+            if (!qrResult.success) {
                 await page.screenshot({ path: screenshotPath, fullPage: false });
+                qrResult = await qrUtils.decodeAndPrintQR(screenshotPath);  // 最后一级打印失败日志
             }
-
-            const qrResult = await qrUtils.decodeAndPrintQR(screenshotPath);
             if (qrResult.success) {
                 this._logStep('QR码识别', '识别成功并打印到终端', { link: qrResult.result }, true);
                 console.log('[GoofishScraper] 请使用【闲鱼 APP】扫描上方二维码登录');
@@ -1025,7 +1176,11 @@ class GoofishScraper extends BaseScraper {
                         }
                     }
                     if (!clicked && allKeepBtns.length > 0) {
-                        this._logStep('保持按钮-轮询', '按钮存在但不可见，继续等待', { btnCount: allKeepBtns.length }, false);
+                        // 按钮存在但不可见 — 用户可能还没扫码，这是正常状态
+                        // 只在首次发现时打印日志
+                        if (Date.now() - start < 3000) {
+                            this._logStep('保持按钮-轮询', '按钮存在但不可见（等待扫码）', { btnCount: allKeepBtns.length }, true);
+                        }
                     }
                     if (clicked) {
                         // “保持”按钮已点击，等待登录完成
@@ -1111,48 +1266,44 @@ class GoofishScraper extends BaseScraper {
      * 检查当前登录状态
      *
      * 检测逻辑（按优先级）：
-     *   1. "立即登录"按钮可见 → 未登录（最可靠，首页专有）
-     *   2. 登录 iframe 存在 → 未登录
-     *   3. 无登录提示 + 无 iframe → 已登录
-     *
-     * 注意：头像不可靠（未登录也显示），cookie 不可靠（可能过期）
+     *   1. nick 文本 = "登录" → 未登录（最可靠）
+     *   2. nick 文本 ≠ "登录" 且非空 → 已登录（正向确认）
+     *   3. 登录 iframe 存在 → 未登录
+     *   4. 无法确定 → 返回 false
      *
      * @returns {Promise<boolean>}
      */
     async _checkLoginStatus() {
         const selectors = this.constructor.TRIGGER_SELECTORS;
 
-        // 方式1（最高优先级）：“立即登录”按钮可见 = 未登录
-        if (selectors.loginPromptBtn) {
-            try {
-                const btn = this._page.locator(selectors.loginPromptBtn).first();
-                if (await btn.count() > 0 && await btn.isVisible({ timeout: 1000 })) {
-                    return false;  // “立即登录”可见 → 确定未登录
+        // 方式1: 通过 page.evaluate 直接读取 nick 文本（避免 CSS 选择器 hash 问题）
+        try {
+            const nickText = await this._page.evaluate(() => {
+                const nick = document.querySelector('div[class*="nick"]');
+                if (nick) return nick.textContent?.trim() || '';
+                const container = document.querySelector('div[class*="user-order-container"]');
+                if (container) {
+                    const divs = container.querySelectorAll('div, span');
+                    for (const d of divs) {
+                        const t = d.textContent?.trim();
+                        if (t && t.length < 20 && d.children.length === 0) return t;
+                    }
                 }
-            } catch { /* 继续 */ }
-        }
+                return '';
+            }).catch(() => '');
+            console.log(`[GoofishScraper] _checkLoginStatus nick: "${nickText}"`);
+            if (nickText === '登录') return false;  // 未登录
+            if (nickText && nickText !== '登录') return true;  // 已登录（昵称）
+        } catch { /* 继续 */ }
 
         // 方式2：登录 iframe 存在 = 未登录
         const loginFrame = await this._detectLoginIframe(1500);
         if (loginFrame) {
-            return false;  // iframe 存在 → 确定未登录
+            return false;
         }
 
-        // 方式3：header 右侧文字检测
-        // 未登录: "登录订单"  已登录: "用户名订单"
-        try {
-            const container = await this._page.$('div[class*="user-order-container"]').catch(() => null);
-            if (container) {
-                const text = await container.textContent().catch(() => '');
-                // 未登录时文字以"登录"开头
-                if (text && text.startsWith('登录')) {
-                    return false;
-                }
-            }
-        } catch { /* 继续 */ }
-
-        // 无登录提示 + 无 iframe + header 不含"登录" → 已登录
-        return true;
+        // 无法确定 → 偏向未登录
+        return false;
     }
 
     // ---------- 登录 cookie 持久化 ----------
@@ -1181,7 +1332,9 @@ class GoofishScraper extends BaseScraper {
 
             const persistedCookies = cookies.map(cookie => {
                 // session cookie: expires = -1 或 expires = 0（无过期时间）
-                if (!cookie.expires || cookie.expires <= 0) {
+                // 过期 cookie: expires < 当前时间
+                const nowSec = Math.floor(now / 1000);
+                if (!cookie.expires || cookie.expires <= 0 || cookie.expires < nowSec) {
                     modifiedCount++;
                     return {
                         ...cookie,
@@ -1199,7 +1352,7 @@ class GoofishScraper extends BaseScraper {
                 totalCookies: cookies.length,
                 modifiedCount,
                 domains: [...new Set(cookies.map(c => c.domain))],
-            }, modifiedCount > 0);
+            }, true);  // modifiedCount=0 表示所有cookie已有expires，也是成功
         } catch (e) {
             this._logStep('Cookie持久化', '强制延长cookie有效期', { error: e.message }, false);
         }
@@ -1548,44 +1701,63 @@ class GoofishScraper extends BaseScraper {
     // ---------- 分页翻页 ----------
 
     /**
+     * 读取搜索页总页数（如 "1/50" 中的 50）
+     * @returns {Promise<number>} 总页数，找不到返回 0
+     */
+    async _getTotalPages() {
+        try {
+            const el = await this._page.$('span[class*="search-page-tiny-page"], div[class*="search-page-tiny-container"] span');
+            if (!el) return 0;
+            const text = await el.textContent();
+            const match = text.match(/(\d+)\s*\/\s*(\d+)/);
+            return match ? parseInt(match[2], 10) : 0;
+        } catch { return 0; }
+    }
+
+    /**
+     * 读取当前页码（如 "3/50" 中的 3）
+     * @returns {Promise<number>} 当前页码，找不到返回 0
+     */
+    async _getCurrentPage() {
+        try {
+            const el = await this._page.$('span[class*="search-page-tiny-page"], div[class*="search-page-tiny-container"] span');
+            if (!el) return 0;
+            const text = await el.textContent();
+            const match = text.match(/(\d+)\s*\/\s*(\d+)/);
+            return match ? parseInt(match[1], 10) : 0;
+        } catch { return 0; }
+    }
+
+    /**
      * 检查当前搜索页是否有下一页
-     * 策略1：找页码文本（如 "1/10"），判断当前页是否小于总页数
-     * 策略2：找"下一页"按钮，检查是否 disabled
+     *
+     * 闲鱼分页 DOM 结构（实测）：
+     *   div[class*="search-page-tiny-container"]
+     *     ├── button (上一页，首页时 disabled)
+     *     ├── span[class*="search-page-tiny-page"] → "1/50"
+     *     └── button (下一页，末页时 disabled)
+     *          └── div[class*="search-page-tiny-arrow-right"]
+     *
      * @returns {Promise<boolean>}
      */
     async _hasNextPage() {
         const page = this._page;
         try {
-            // 策略1：页码文本 div[class*="search-page-tiny"] span
-            const pageInfoEl = await page.$('div[class*="search-page-tiny"] span, div[class*="pagination-info"] span');
+            // 策略1：读页码文本（如 "1/50"），判断当前页 < 总页数
+            const pageInfoEl = await page.$('span[class*="search-page-tiny-page"], div[class*="search-page-tiny-container"] span');
             if (pageInfoEl) {
                 const text = await pageInfoEl.textContent();
                 const match = text.match(/(\d+)\s*\/\s*(\d+)/);
                 if (match) {
                     const current = parseInt(match[1], 10);
                     const total = parseInt(match[2], 10);
-                    const hasNext = current < total;
-                    if (!hasNext) return false;
-                    // 有下一页，继续走策略2确认按钮存在
+                    return current < total;
                 }
             }
 
-            // 策略2：检查"下一页"按钮是否存在且未禁用
-            const nextBtn = await page.$('button[class*="next"]:not([disabled])');
-            if (nextBtn && await nextBtn.isVisible().catch(() => false)) {
-                return true;
-            }
-
-            // 策略3：分页容器内最后一个按钮不是当前激活页
-            const lastBtn = await page.$('div[class*="search-footer-page"] button:last-child, div[class*="pagination"] button:last-child');
-            if (lastBtn) {
-                const cls = await lastBtn.getAttribute('class') || '';
-                const text = await lastBtn.textContent() || '';
-                // 如果最后一个按钮不是 "..." 或 disabled，且文本是数字，可能还有页
-                if (!cls.includes('disabled') && !text.includes('...') && /^\d+$/.test(text.trim())) {
-                    return true;
-                }
-            }
+            // 策略2：下一页按钮存在且未禁用
+            const nextBtn = await page.$('div[class*="search-page-tiny-container"] button:last-child:not([disabled])');
+            if (nextBtn) return true;
 
             return false;
         } catch {
@@ -1595,32 +1767,34 @@ class GoofishScraper extends BaseScraper {
 
     /**
      * 点击"下一页"按钮
+     *
+     * 闲鱼下一页按钮 = 分页容器内最后一个 button（含右箭头图标）
      * @returns {Promise<boolean>} 是否成功点击
      */
     async _clickNextPage() {
         const page = this._page;
-        const selectors = this.constructor.TRIGGER_SELECTORS;
 
-        // 策略1：直接定位 next 按钮
-        const nextBtn = await page.$(selectors.nextPageBtn);
-        if (nextBtn && await nextBtn.isVisible().catch(() => false)) {
-            await nextBtn.click();
-            console.log('[GoofishScraper] 已点击下一页按钮');
-            return true;
+        // 策略1：找到右箭头图标的父级 button（最精准）
+        const rightArrow = await page.$('div[class*="search-page-tiny-arrow-right"]');
+        if (rightArrow) {
+            const btnHandle = await rightArrow.evaluateHandle(el => el.closest('button'));
+            const btn = btnHandle.asElement();
+            if (btn) {
+                const disabled = await btn.getAttribute('disabled');
+                if (!disabled) {
+                    await btn.click();
+                    console.log('[GoofishScraper] 已点击下一页按钮（右箭头）');
+                    return true;
+                }
+            }
         }
 
-        // 策略2：在分页容器内找最后一个可见按钮（通常"下一页"在末尾）
-        const paginationBtns = await page.locator('div[class*="search-footer-page"] button:visible, div[class*="pagination"] button:visible').all();
-        if (paginationBtns.length > 0) {
-            const lastBtn = paginationBtns[paginationBtns.length - 1];
-            const text = await lastBtn.textContent().catch(() => '');
-            const cls = await lastBtn.getAttribute('class').catch(() => '');
-            // 跳过 "..." 和 disabled 按钮
-            if (!cls.includes('disabled') && !text.includes('...')) {
-                await lastBtn.click();
-                console.log('[GoofishScraper] 已点击分页末尾按钮:', text.trim());
-                return true;
-            }
+        // 策略2：分页容器内最后一个 button（未被 disabled）
+        const nextBtn = await page.$('div[class*="search-page-tiny-container"] button:last-child:not([disabled])');
+        if (nextBtn && await nextBtn.isVisible().catch(() => false)) {
+            await nextBtn.click();
+            console.log('[GoofishScraper] 已点击下一页按钮（末尾按钮）');
+            return true;
         }
 
         console.log('[GoofishScraper] 未找到可点击的下一页按钮');
@@ -1630,21 +1804,9 @@ class GoofishScraper extends BaseScraper {
     // ---------- 商品详情 ----------
 
     /**
-     * 滚动页面加载评价列表
-     */
-    async _scrollForReviews() {
-        const page = this._page;
-        // 滚动到页面底部，触发评价加载
-        for (let i = 0; i < 3; i++) {
-            await page.evaluate(() => window.scrollBy(0, 500));
-            await this._humanDelay(500, 1000);
-        }
-    }
-
-    /**
      * 组装商品详情数据
      */
-    _assembleProductDetail({ itemId, detailData, sellerData, reviewData, screenshotUrl }) {
+    _assembleProductDetail({ itemId, detailData, sellerData, screenshotUrl }) {
         // 根据实际 API 响应结构解析
         // 详情 API: taobao.idle.pc.detail/1.0
         // 返回格式: { data: { itemDO, sellerDO, picDetailDO } }
@@ -1653,6 +1815,7 @@ class GoofishScraper extends BaseScraper {
 
         return {
             itemId: itemDO?.itemId || itemId,
+            sellerId: sellerDO?.sellerId || '',
             title: itemDO?.title || '',
             price: itemDO?.soldPrice || '',         // 注意: 字段是 soldPrice 不是 price
             originalPrice: itemDO?.originalPrice || '',
@@ -1668,10 +1831,14 @@ class GoofishScraper extends BaseScraper {
             quantity: itemDO?.quantity || 0,
             collectCnt: itemDO?.collectCnt || 0,
             wantCnt: itemDO?.wantCnt || 0,
-            createdTime: itemDO?.gmtCreate || '',
+            createdTime: parseInt(itemDO?.gmtCreate) || 0,
             transportFee: itemDO?.transportFee || '',
             categoryId: itemDO?.categoryId || '',
             itemStatus: itemDO?.itemStatusStr || '',
+            location: itemDO?.prov || itemDO?.location || '',
+            area: itemDO?.city || itemDO?.area || '',
+            conditionName: itemDO?.conditionName || '',
+            tagList: Array.isArray(itemDO?.tagList) ? itemDO.tagList.map(t => typeof t === 'string' ? t : t?.text || '').filter(Boolean).join(',') : '',
             seller: {
                 id: sellerDO?.sellerId || '',
                 name: sellerDO?.nick || '',
@@ -1683,11 +1850,9 @@ class GoofishScraper extends BaseScraper {
                 goodRatio: sellerDO?.newGoodRatioRate || '',
                 creditLevel: sellerDO?.zhimaLevelInfo?.levelName || '',
             },
-            reviews: reviewData?.list || [],
             screenshotUrl,
             rawDetail: detailData,
             rawSeller: sellerData,
-            rawReview: reviewData,
         };
     }
 
@@ -1708,6 +1873,7 @@ class GoofishScraper extends BaseScraper {
         }));
         return {
             itemId: dbRow.item_id,
+            sellerId: dbRow.seller_id || dbRow.seller?.user_id,
             title: dbRow.title,
             price: dbRow.price,
             originalPrice: dbRow.original_price,
@@ -1721,6 +1887,10 @@ class GoofishScraper extends BaseScraper {
             transportFee: dbRow.transport_fee,
             categoryId: dbRow.category_id,
             itemStatus: dbRow.item_status,
+            location: dbRow.location || '',
+            area: dbRow.area || '',
+            conditionName: dbRow.condition_name || '',
+            tagList: dbRow.tag_list || '',
             screenshotUrl: dbRow.screenshot_url,
             uploadedImages: images,
             seller: dbRow.seller ? {
@@ -1749,6 +1919,11 @@ class GoofishScraper extends BaseScraper {
             price: item.price,
             imageUrl: item.image_url,
             wantCnt: item.want_cnt,
+            soldCnt: item.sold_cnt || 0,
+            isSold: item.is_sold || 0,
+            area: item.area || '',
+            categoryId: item.category_id || 0,
+            status: item.status || '',
         }));
         const ratings = (dbRow.ratings || []).map(r => ({
             content: r.content,
@@ -1759,6 +1934,9 @@ class GoofishScraper extends BaseScraper {
             tags: r.tags ? r.tags.split(',').filter(Boolean) : [],
             customWords: r.custom_words ? r.custom_words.split(',').filter(Boolean) : [],
             ipLocation: r.ip_location,
+            sellerReply: r.seller_reply || '',
+            images: r.images ? r.images.split(',').filter(Boolean) : [],
+            isAnonymous: r.is_anonymous || 0,
         }));
         const totalRatings = ratings.length;
         const goodRatings = ratings.filter(r => r.rate === 1).length;

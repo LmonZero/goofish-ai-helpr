@@ -1,7 +1,8 @@
 /**
- * AIFish 闲鱼AI筛查脚本
+ * AIFish 闲鱼爬取脚本
  *
- * 完整流程：配置读取 → 闲鱼爬取 → 去重筛查 → AI 分析 → 结果存储 → 钉钉通知
+ * 流程：配置读取 → 闲鱼搜索 → 逐个爬取商品/卖家详情 → 入库
+ * 不含 AI 分析，AI 分析由 aifish-analyze.js 独立完成
  *
  * 用法：
  *   node script/aifish-run.js ./script/json/AIFish-example.json
@@ -10,11 +11,7 @@
 const fs = require('fs');
 const path = require('path');
 const GoofishScraper = require('../scraper/GoofishScraper');
-const DoubaoAnalyzer = require('../analyzer/DoubaoAnalyzer');
-const ZhiPuAnalyzer = require('../analyzer/ZhiPuAnalyzer');
-const { buildPrompt } = require('../scraper/prompt-builder');
 const { XianyuDB } = require('../scraper/db');
-const DingDingNotifier = require('../notify/DingDingNotifier');
 
 // ======================== 配置加载 ========================
 
@@ -42,34 +39,32 @@ async function main() {
     const config = loadConfig(configPath);
 
     console.log('╔══════════════════════════════════════╗');
-    console.log('║          AIFish 闲鱼AI筛查           ║');
+    console.log('║       AIFish 闲鱼商品爬取            ║');
     console.log('╚══════════════════════════════════════╝');
     console.log(`关键词: ${config.keyword}`);
-    console.log(`AI平台: ${config.intelligent ? '豆包(深度思考)' : '豆包(快速)'}`);
-    console.log(`提示词: ${config.promptBase} + ${config.promptCriteria}`);
-    console.log(`去重:   ${config.againDay}天 / 捡漏忽略 ${config.bargainDay}天`);
-    console.log(`翻页:   最多 ${config.maxPages || 10} 页`);
+    console.log(`翻页:   ${config.maxPages > 0 ? `最多 ${config.maxPages} 页` : '全部页'}`);
     console.log('');
 
     // ---- 1. 初始化数据库 ----
-    console.log('[1/6] 初始化数据库...');
-    const db = new XianyuDB(config.dbPath);
+    console.log('[1/4] 初始化数据库...');
+    const db = new XianyuDB(config.dbPath, config.freshTTLDays);
     db.open();
 
     // ---- 2. 启动闲鱼爬虫 ----
-    console.log('[2/6] 启动闲鱼爬虫...');
+    console.log('[2/4] 启动闲鱼爬虫...');
     const scraper = new GoofishScraper({
         dataName: config.dataName,
         headless: config.headless,
         loginTimeout: config.loginTimeout,
+        freshTTLDays: config.freshTTLDays,
     });
     await scraper.init();
-    console.log('[2/6] 闲鱼爬虫就绪\n');
+    console.log('[2/4] 闲鱼爬虫就绪\n');
 
     // ---- 3. 搜索商品 ----
-    console.log(`[3/6] 搜索 "${config.keyword}"...`);
-    const searchResults = await scraper.search(config.keyword, {}, { maxPages: config.maxPages || 10 });
-    console.log(`[3/6] 搜索完成，${searchResults.length} 个商品\n`);
+    console.log(`[3/4] 搜索 "${config.keyword}"...`);
+    const searchResults = await scraper.search(config.keyword, {}, { maxPages: config.maxPages || 0 });
+    console.log(`[3/4] 搜索完成，${searchResults.length} 个商品\n`);
 
     if (searchResults.length === 0) {
         console.log('没有搜索结果，退出');
@@ -78,133 +73,73 @@ async function main() {
         return;
     }
 
-    // ---- 4. 初始化 AI 分析器 ----
-    console.log('[4/6] 初始化 AI 分析器...');
-    const analyzer = new DoubaoAnalyzer({
-        deepThink: config.intelligent,
-        loginTimeout: config.loginTimeout,
-    });
-    // 复用爬虫的浏览器上下文（同一个 userData，cookie 域隔离）
-    analyzer.setContext(scraper.context);
-    await analyzer.init();
-    console.log('[4/6] AI 分析器就绪\n');
+    // ---- 4. 逐个爬取并入库 ----
+    let scraped = 0, skipped = 0, failed = 0;
 
-    const notifier = new DingDingNotifier();
-    let analyzed = 0, skipped = 0, recommended = 0;
-
-    // ---- 5. 逐个分析商品 ----
     for (let i = 0; i < searchResults.length; i++) {
         const item = searchResults[i];
-        const addr = item.url || `https://www.goofish.com/item?id=${item.itemId}`;
-        const price = item.price || '';
+        console.log(`--- [4/4] ${i + 1}/${searchResults.length} ${item.title?.slice(0, 40) || item.itemId} ---`);
 
-        console.log(`--- [5/6] ${i + 1}/${searchResults.length} ${item.title?.slice(0, 40) || item.itemId} ---`);
+        // 4a. 新鲜度去重由 scrapeProduct 内部处理（跳过网络请求，返回DB缓存数据）
+        // 这里不再重复检查，因为：
+        //   - 商品新鲜 → scrapeProduct 返回 DB 缓存 → saveProduct 也跳过写入
+        //   - 商品过期 → scrapeProduct 重新爬取 → saveProduct 覆盖写入
 
-        // 5a. 去重筛查
-        const skip = db.shouldSkipAnalysis(addr, config.againDay, config.bargainDay);
-        if (skip.skip) {
-            console.log(`  ⏭ 跳过: ${skip.reason}`);
-            skipped++;
-            continue;
-        }
-
-        // 价格精确去重
-        if (db.isDuplicateAnalysis(addr, price)) {
-            console.log(`  ⏭ 跳过: 同链接同价格已存在`);
-            skipped++;
-            continue;
-        }
-
-        // 5b. 爬取商品详情
+        // 4b. 爬取商品详情
         let product;
         try {
             product = await scraper.scrapeProduct(item.itemId);
         } catch (e) {
             console.log(`  ❌ 商品详情爬取失败: ${e.message}`);
+            failed++;
             continue;
         }
         if (!product) {
             console.log(`  ❌ 商品详情为空`);
+            failed++;
             continue;
         }
 
-        // 5c. 爬取卖家详情
-        let seller = null;
-        const sellerId = product.sellerId || product.seller?.userId;
+        // 4c. 商品数据入库（saveProduct 内部也做新鲜度检查，已新鲜则跳过写入）
+        product.keyword = config.keyword || '';  // 记录搜索关键词，用于分析检索
+        const saveResult = db.saveProduct(product);
+        if (saveResult.saved) {
+            console.log(`  ✅ 商品入库: ${product.title?.slice(0, 40)} (${saveResult.reason})`);
+            scraped++;
+        } else if (saveResult.reason === 'no_seller') {
+            console.log(`  ⏭ 商品跳过: ${product.title?.slice(0, 40)} (卖家ID缺失，等下次重试)`);
+            skipped++;
+            continue;  // 没有卖家ID，跳过卖家爬取
+        } else {
+            console.log(`  ⏭ 商品跳过: ${product.title?.slice(0, 40)} (${saveResult.reason})`);
+            skipped++;
+        }
+
+        // 4d. 爬取卖家详情（sellerId 从 product.sellerId 或 product.seller.id 获取）
+        const sellerId = product.sellerId || product.seller?.id;
         if (sellerId) {
             try {
-                seller = await scraper.scrapeSeller(sellerId);
+                const seller = await scraper.scrapeSeller(sellerId);
+                const sellerResult = db.saveSeller(seller);
+                console.log(`  ✅ 卖家入库: userId=${sellerId} (${sellerResult.saved ? sellerResult.reason : '跳过-' + sellerResult.reason})`);
             } catch (e) {
                 console.log(`  ⚠ 卖家详情爬取失败: ${e.message}`);
             }
         }
-
-        // 5d. 构建 AI 提示词
-        const { text: promptText, images } = buildPrompt(config, product, seller || {});
-
-        // 5e. AI 分析
-        let aiResult;
-        try {
-            aiResult = await analyzer.analyze(promptText, { deepThink: config.intelligent });
-        } catch (e) {
-            console.log(`  ❌ AI 分析失败: ${e.message}`);
-            continue;
-        }
-
-        if (!aiResult || !aiResult.answer) {
-            console.log(`  ❌ AI 返回为空`);
-            continue;
-        }
-
-        // 5f. 解析 AI 返回的 JSON
-        let aiReply;
-        try {
-            aiReply = analyzer.extractJSON(aiResult.answer);
-        } catch (e) {
-            console.log(`  ⚠ AI 返回非 JSON，原始内容: ${aiResult.answer.slice(0, 100)}...`);
-            aiReply = { raw: aiResult.answer };
-        }
-
-        // 5g. 保存结果
-        db.saveAnalysis({
-            itemId: item.itemId,
-            keyword: config.keyword,
-            addr,
-            price,
-            description: item.title || product.title || '',
-            images: (product.uploadedImages || []).map(img => img.uploadedUrl || img.url),
-            aiReply,
-        });
-
-        analyzed++;
-        console.log(`  ✅ 分析完成: is_recommend=${aiReply.is_recommend}, reason=${(aiReply.reason || '').slice(0, 60)}`);
-
-        // 5h. 推荐商品 → 钉钉通知
-        if (aiReply.is_recommend) {
-            recommended++;
-            try {
-                await notifier.notifyFishBargain(
-                    config.ddUrl,
-                    { addr, price, description: item.title || product.title || '', aiReply },
-                    config.phtoneDomain,
-                    config.keyword,
-                );
-                console.log(`  📢 钉钉通知已发送`);
-            } catch (e) {
-                console.log(`  ⚠ 钉钉通知失败: ${e.message}`);
-            }
-        }
     }
 
-    // ---- 6. 汇总 ----
+    // ---- 汇总 ----
     console.log('');
     console.log('╔══════════════════════════════════════╗');
-    console.log('║             运行结果汇总              ║');
+    console.log('║             爬取结果汇总              ║');
     console.log('╚══════════════════════════════════════╝');
     console.log(`  搜索结果: ${searchResults.length}`);
-    console.log(`  跳过(去重): ${skipped}`);
-    console.log(`  AI 分析:   ${analyzed}`);
-    console.log(`  推荐商品:  ${recommended}`);
+    console.log(`  跳过(新鲜): ${skipped}`);
+    console.log(`  新增入库:  ${scraped}`);
+    console.log(`  失败:      ${failed}`);
+
+    const stats = db.getStats();
+    console.log(`  DB 商品总数: ${stats.products}`);
 
     await scraper.close();
     db.close();

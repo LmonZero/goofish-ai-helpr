@@ -29,6 +29,12 @@ const SCRIPTS = {
         usage: 'node main.js criteria <商品名称> <平台> [选项]',
         example: 'node main.js criteria "iPhone 16 Pro" doubao',
     },
+    analyze: {
+        file: 'script/aifish-analyze.js',
+        desc: 'AI 分析已爬取商品（DB→AI→入库→通知）',
+        usage: 'node main.js analyze <配置文件>',
+        example: 'node main.js analyze ./script/json/AIFish-example.json',
+    },
 };
 
 function printHelp() {
